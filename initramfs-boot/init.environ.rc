@@ -1,0 +1,259 @@
+# HarmonyOS emu: APEX'leri init'in kendi zamanlamasinda bagla.
+#
+# Neden init icinde degil de burada? Android init birinci asamada /apex'in
+# UZERINE kendi tmpfs'sini mount edebilir. /init (bizim initramfs init'i)
+# icinde mount edersek gizlenir. Burada 'on early-init' tetiklemesi,
+# init'in mount'lari bittikten sonra calisir.
+#
+# DIKKAT: 'exec -- /bb/diag' birinci asamada calismiyor (stok init.rc'de de
+# yalnizca /system/bin/... yolu kullaniliyor). Desteklenen yol exec_start.
+on early-init
+    start mount_harmony_apex
+    start harmony_diag
+    # DIKKAT (2026-10-16, adbd'nin TCP ACILMAMASININ ASIL NEDENI):
+    # AUTOPSY (elle baslatip stderr'i dosyaya yazarak) su satiri
+    # gosterdi ve sonrasi KESILDI:
+    #     adbd I adb_wifi.cpp:196] Waiting for persist.adb.tls_server.enable=1
+    #     adbd I main.cpp:                      <-- burada bitti
+    #     AUTOPSY tcp5555: 0
+    # Yani adbd TCP:5555 dinleyicisini ACMADAN once bu ozelligi
+    # bekliyor ve hic tanimli olmadigi icin (olcduk: /system/build.prop,
+    # /vendor/build.prop, /system/etc/prop.default -> HICBIRINDE yok)
+    # sonsuza kadar bekliyor. Surec yasaiyor, port acilmiyor.
+    # Cozum: degeri 0 olarak ONCEDEN set et. 1 degil, sifir: TLS
+    # sunucusu istemiyoruz, duz TCP istiyoruz.
+    setprop persist.adb.tls_server.enable 0
+    # DIKKAT (EVR-L29/Android 10): ro.serialno prop dosyalarda yok,
+    # init bunu genişletemiyor ve 127 ile çıkıyor. Önceden set et.
+    setprop ro.serialno unknown
+    # DIKKAT (2026-10-16, L4 3. KOK NEDEN): hw/init.rc'deki zygote
+    # tetikleyicisi SIFRELENMIS /data'yi bekliyor:
+    #     on zygote-start && property:ro.crypto.state=unencrypted
+    #         start zygote
+    # OLCULDU: getprop ro.crypto.state -> BOS. cunku vold her 5
+    # saniyede cokuyor:
+    #     Abort message: Check failed: android::vold::sBlkidContext
+    # Dolayisiyla 'zygote-start' tetigi hic zaman gelmiyor ve zygote
+    # OTOMATIK baslamiyor (elle 'setprop ctl.start zygote' ile
+    # baslatiyorduk ve o da asagida duzelttigimiz ikinci engele
+    # takiliyordu).
+    # 'ro.' salt-okunur ve ILK tanim kazanir; hicbir yerde tanimli
+    # olmadigi icin burada guvenle yazabiliyoruz.
+    # DIKKAT (2026-10-16, GERI ALMA): 'ro.crypto.state unencrypted'
+    # burada BIRAKILDI. Tek amaci zygote tetikleyicisini
+    # ('on zygote-start && property:ro.crypto.state=unencrypted')
+    # hazirlamakti; ama o tetik bizim supervisor'imiz
+    # (ensure_zygote -> setprop ctl.start zygote) ile zaten
+    # saglaniyor. Buna karsi bu ozellik init in adbd'sini
+    # komik ediyor:
+    #     init: Service 'adbd' (pid 7044) exited with status 1
+    # L5 (adb shell) bu kosudan once bu ozellik YOKKEN calisiyordu.
+    # Iki deneme yapildi:
+    #   ro.crypto.state=unencrypted + ro.crypto.type=file  -> adbd exit 1
+    #   ro.crypto.state=unencrypted (type birakildi)      -> adbd exit 1
+    # Yani tetikleyici adbd icin ZARARLI; zygote'yi elle
+    # baslattigimiz icin bize de lazim degil.
+    # DIKKAT (2026-10-16, L4 4. KOK NEDEN): zygote ANDROID_DATA'siz
+    # ABORT ediyor. OLCULEN HATA (logcat):
+    #     F DEBUG : Abort message: 'ANDROID_DATA environment variable
+    #              unset'
+    #     D AndroidRuntime: >>>>>> START com.android.internal.os.
+    #                        ZygoteInit uid 0 <<<<<<
+    # Yani ZygoteInit BASLIYOR sonra ANDROID_DATA arayinca abort
+    # ediyor. Elle calistirilip cikti yakalandiginda:
+    #     export ANDROID_DATA=/data ANDROID_ROOT=/system
+    #     app_process64 -Xzygote ... -> HATASIZ calisiyor
+    # yani zygote saglam, sadece ortam eksik.
+    #
+    # OLCUM (neden init vermiyordu):
+    #     tr '\0' '\n' < /proc/1/environ | grep ANDROID  -> BOS
+    # init'in kendi ortaminda sadece PATH var. Ve bu bir PROPERTY
+    # degil: getprop ANDROID_DATA -> BOS.
+    #
+    # COZUM: init 'setenv' komutunu destekliyor (init ikilisinde
+    # 'setenv' dizesi VAR -- olculdu). init kendi ortamini degistirir,
+    # sonraki tum servisler onu MİRAS alir. Servisleri biz
+    # ctl.start ile baslattigimiz icin (ensure_zygote, n>=30) zamanlama
+    # sorun degil.
+    setenv ANDROID_DATA /data
+    setenv ANDROID_ROOT /system
+    setenv ANDROID_RUNTIME_ROOT /apex/com.android.art
+    setenv ANDROID_TZDATA_ROOT /apex/com.android.tzdata
+    setenv ANDROID_IOTA_ROOT /apex/com.android.iota
+
+# HarmonyOS emu: zygote'nin ihtiyac duydugu /data dizinleri.
+#
+# OLCULEN HATA (elle zygote calistirilip cikti yakalandi):
+#     Error creating cache dir /data/dalvik-cache/arm64
+#         : No such file or directory
+#     Aborted
+# /data bizim tmpfs'imiz (2.0G) ve BOS; vold coktugu icin de
+# icerigi kurulmuyor. Dalvik cache olmadan zygote ABORT ediyor.
+#
+# DIKKAT: 'mkdir' komutu init'te destekleniyor ve SELinux permissive
+# oldugu icin izin sorunu yok (olculdu: mkdir -p TAMAM dondu).
+# Dizinleri zygote'den ONCE kurmaliyiz: post-fs-data, early-init
+# sonrasi ve class main oncesi.
+on post-fs-data
+    mkdir /data/dalvik-cache
+    mkdir /data/dalvik-cache/arm
+    mkdir /data/dalvik-cache/arm64
+    mkdir /data/dalvik-cache/x86
+    mkdir /data/dalvik-cache/x86_64
+    mkdir /data/system
+    mkdir /data/system/packages
+    mkdir /data/misc
+    mkdir /data/local
+    mkdir /data/local/tmp
+    mkdir /data/app
+    mkdir /data/media
+    mkdir /data/media/0
+    mkdir /data/user
+    mkdir /data/user/0
+
+service mount_harmony_apex /bb/mountapex
+    class core
+    user root
+    group root
+    oneshot
+    disabled
+
+service harmony_diag /bb/diag
+    class core
+    user root
+    group root
+    oneshot
+    disabled
+
+# HarmonyOS emu: adbd'yi init'in KENDI yoluyla baslat.
+#
+# Neden elle degil? APEX'in kendi /etc/init.rc'si soyle diyor:
+#     service adbd /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0
+#         class core
+#         socket adbd seqpacket 660 system system
+#         disabled
+#         seclabel u:r:adbd:s0
+#
+# Yani adbd'nin birincil tasimasi TCP DEGIL: init bir SEQPACKET unix
+# socketu (/dev/socket/adbd) acar ve surece ANDROID_SOCKET_adbd ortam
+# degiskeniyle fd verir. Elle "adbd tcp:5555" ile baslatinca o fd
+# olmadigi icin su hatayi basip BIRAKIYOR:
+#     adbd E auth.cpp:203] Failed to get adbd socket: Operation not permitted
+# Olcutler (nabiz satirlari):
+#     adbd=ayakta pid=2565 tcp5555=0     <- surec yasiyor, 5555 dinlenmiyor
+#     Windows adb: "offline", QEMU hostfwd RST donuyor
+# (ro.secure=0 / ro.adb.secure=0 ekledik ama yetmedi: bu hataya
+#  ro.adb.secure degil, SOCKET ACTIVATION eksikligi yol aciyor.)
+#
+# Soket adi 'adbd' OLMAK ZORUNDA: adbd kütüphanesindeki
+# android::GetControlSocket() bu adi sabit arar. 'disabled' OLMADI ->
+# class core ile otomatik baslar. --root_seclabel firmware'in kendi
+# degeri; su alani yoksa init servis i baslamaz ve loga yazar.
+#
+# DIKKAT (2026-10-15): init adbd'yi baslattiginda surec olumuyor --
+# once 'starting service adbd' + 'Created socket /dev/socket/adbd' geliyor,
+# sonra svc=restarting oluyor. Sebep LD_LIBRARY_PATH: elle baslatinca
+# adbd'yi calistirmadan once
+#     LD_LIBRARY_PATH=/apex/com.android.adbd/lib64
+# ile basliyorduk ve o zaman calisiyordu (varyant=ldpath). Init kendi
+# ortamini kuruyor, o degisken gelmiyor ve linker
+#     CANNOT LINK EXECUTABLE ...: library "libadb_protos.so" not found
+# diye adbd'yi olduruyor. Cozum: init'in 'setenv' servisi.
+#
+# DIKKAT (2026-10-15, ASIL COZUM): 'tcp:5555' ARGUMANI OLMAYINCA
+# adbd SADECE unix socket'i dinler. Olcut bunu kanitladi:
+#     init: starting service 'adbd'...
+#     init: Created socket '/dev/socket/adbd', mode 660, user 1000
+#     ###   adbd=ayakta svc=restarting pid=2588 tcp5555=0
+# Yani surec yasiyor, init cikisi dogru, ama /proc/net/tcp'te 5555
+# YOK; QEMU'nun hostfwd'i guest'e ulasamiyor ve Windows adb
+# "offline" veriyordu. APEX'in kendi init.rc'sinde de tcp argmani
+# yok -- cunku gercek cihazda adbd USB/UFS ile init tarafindan
+# besleniyor, TCP ek yol olarak 'setprop service.adb.tcp.port 5555'
+# ile ARIYILDAN SONRA aciliyor. Biz o yolu elle acmak yerine
+# argumani dogrudan veriyoruz (daha deterministik).
+# 'localfilesystem:' de ekliyoruz ki hem unix hem TCP calissin.
+# DIKKAT (2026-10-16, 'socket' SATIRI KALDIRILDI):
+# Ayirt edici olcum (olcduk, arac saglam):
+#     5900 (bos port)  -> Connection refused  (QEMU guest'e ULASIR)
+#     5555             -> TCP KURULDU, sonra ANINDA RST
+#     baglanti sirasinda guest logunda HICBIR IZ yok (adbd AVC dahil)
+# Yani adbd 5555'i dinliyor, baglantiyi kabul ediyor, cocuk surec
+# olusturup ANINDA olup bitiyor. Adbd'in auth yolu (auth.cpp) her
+# baglantida init'ten ANDROID_SOCKET_adbd fd'si istiyor ve bizim
+# init tanimimiz bu fd'yi 'seqpacket' olarak veriyor; adbd STREAM
+# bekliyor, uyumsuzluk olup cocuk sureci olduruyor olabilir.
+# COZUM DENEMESI: 'socket' satiri hic koymuyoruz -> adbd saf TCP
+# uzerinden calisir, auth icin socket ARAMAZ (ro.adb.secure=0
+# zaten auth'u kapatiyor).
+service adbd /apex/com.android.adbd/bin/adbd tcp:5555
+    class core
+    seclabel u:r:adbd:s0
+    override
+    # DIKKAT (2026-10-16): bu tanim /init.environ.rc ICINDE ve
+    # rclog bu dosyayi ISLEMEZ (o yalnizca bind-mount edilen rc
+    # agacini yamalayor). Bu yuzden stdio_to_kmsg otomatik eklenmiyor
+    # ve init in adbd'si OLURKEN hicbir sey yazmiyor:
+    #     init: Service 'adbd' (pid 7044) exited with status 1
+    # Elle baslatilan adbd ise sorunsuz:
+    #     main.cpp:186] adbd listening on tcp:5555
+    # Yani ikili saglam; sorun bu servisin baslatilma yolunda.
+    # DIKKAT: bu init surumu 'stdout'/'stderr' secenegini DESTEKLEMIYOR
+    #     init: ... Invalid keyword [stdout]
+    # dogru secenek stdio_to_kmsg.
+    stdio_to_kmsg
+    setenv LD_LIBRARY_PATH /apex/com.android.adbd/lib64
+    setenv HOME /tmp
+    setenv TMPDIR /tmp
+
+# ---------------------------------------------------------------------
+# DIKKAT (OLCUM SERVISI 2026-10-18): arkinit'in dlopen izini
+# almak icin. NEDEN GEREKIYOR:
+#
+#   * app_process64'un ART yolunda VM HIC olusmuyor (dltrace
+#     kaniti: 10 dlopen cagri, hicbiri libart icin, 0 basarisiz)
+#   * Ark yolunu elle taklit ettigimizde de Ark yuklenmiyor
+#     (ARK_RUNTIME=libarkruntime.so env degiskeni tek basina
+#      yetmiyor; hicbir kutuphanenin DT_NEEDED'inde libarkruntime.so
+#      YOK -- olculdu)
+#   * init'in baslattigi GERCEK arkinit sureci cok kisa yasadigi
+#     icin /proc haritasini yakalayamadik (zombi olarak bulduk)
+#
+# Bu servis, init.arkinit.rc'deki arkinit taniminin BIREBIR kopyasi
+# + tek fark: LD_PRELOAD=/data/dltrace.so. Boylece:
+#   - init ona GERCEK ortami verir (setenv'ler dahil)
+#   - SELinux baglami dogru olur (u:r:zygote:s0)
+#   - stdio_to_kmsg ile dltrace ciktisi SERI LOGA duser
+#     (elle calistirdigimizde sadece bize gorunuyordu)
+#
+# DIKKAT: bu bir TEJHIS aracidir, sistemi degistirmez. disabled
+# degil ama ctl.start ile elle baslatilir; surec kendi cikisinda
+# init tarafindan temizlenir.
+# DIKKAT: /data/dltrace.so'nun var olmasi gerekir; bb/supervise
+# her turde /bb/dltrace.so -> /data/dltrace.so kopyalama yapar.
+# ---------------------------------------------------------------------
+service arkprobe /system/bin/app_process64 -Xzygote /system/bin --zygote --nice-name=zygote64 --socket-name=ark
+    onrestart start system_server
+    stdio_to_kmsg
+    setenv ANDROID_DATA /data
+    setenv ANDROID_ROOT /system
+    setenv ANDROID_RUNTIME_ROOT /apex/com.android.art
+    setenv ANDROID_TZDATA_ROOT /apex/com.android.tzdata
+    setenv ANDROID_IOTA_ROOT /apex/com.android.iota
+    setenv ARK_RUNTIME libarkruntime.so
+    setenv LD_PRELOAD /data/dltrace.so
+    class main
+    user root
+    group root
+# DIKKAT (2026-10-18): bu servis OLcum icin ve TEK BASINA calistirilir.
+# boot'ta otomatik BASLATILMAZ (disabled) -- cunku Ark yolunda
+# surec sonsuz donup duruyor ve TCG altinda islemciyi yiyor.
+# Kullanim:  setprop ctl.start arkprobe
+#           /data/dltrace.log dosyasini oku
+# SONUC (olculdu, arac dogrulandi): bu yolda da VM OLUSMUYOR.
+#   DLOPEN "libc.so" x3 / "libnetd_client.so" x2 /
+#   "libiAwareSdkCore.so"  -> hepsi TAMAM
+#   android_dlopen_ext     -> HIC CAGRILMADI
+#   libarkruntime.so       -> YUKLENMEDI
+#   191 benzersiz .so yuklendi, icinde HICBIR VM kutuphanesi
+disabled

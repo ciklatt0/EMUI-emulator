@@ -1,0 +1,2 @@
+#!/bb/sh
+exec /bb/diag "supervisor sonrasi"

@@ -1,0 +1,597 @@
+#!/bb/sh
+# rc dosyalarini yamalayip servis stdout/stderr'ini /dev/kmsg'ye bagla.
+# init'ten ONCE calisir. Kanit ciktisi /dev/kmsg'ye girer.
+OVL=/overlay-rc
+SRC=/overlay-src
+ROOTS=/overlay-roots
+# DIKKAT: /init bu scripti exec etmeden ONCE cagirir; /init'in stdout'u
+# zaten /dev/kmsg. Yine de kendimiz ceviriyoruz (cift yazimi onler).
+exec >/dev/kmsg 2>&1
+log() { /bb/echo "$1"; }
+
+log "--- RC YAMALAMA (servis loglari + Kirin modem blokajini kaldirma) ---"
+rm -rf "$OVL" "$SRC" 2>/bb/nb/null
+mkdir -p "$OVL" "$SRC"
+: > "$ROOTS"
+# --- VENDORRC anahtari (2026-10-15) ----------------------------------------
+# SORUN: vendor_init alt baglami /vendor/etc/init dizinini PARSE ediyor ve
+# ~40 ms icinde status 1 ile oluyor. 102 dosyanin HICBIRINI parse etmiyor
+# ("Parsing file /vendor" sayisi 0). Yani ilk dosyadan once bir sey
+# patliyor. Import yorumunu kaldirmak duzelmedi.
+#
+# DIKKAT: alt baglam HER KEZ basarisiz oldugunda init '/system/bin/init'i
+# 'subcontext' argumanlariyla yeniden fork+exec ediyor. TCG emulasyonunda
+# 2.9 MB'lik bir ikiliyi exec etmek pahalI; andinit olay dongusu bu
+# yuzden hicbir sey yapamiyor:
+#     init: init second stage started!        12.79
+#     init: Restarting subcontext ...          17.81  (4.6 sn bosluk)
+#     init: starting service 'ueventd'...      39.40
+# 'start hwservicemanager' hic olmuyor, o yuzden
+#     on fs: wait_for_prop hwservicemanager.ready true
+# asili kalir ve post-fs-data HIC BASLAMAZ.
+#
+# DENEY: VENDORRC=0 ile /vendor/etc/init dizinini BOS olarak bind-mount
+# ediyoruz. Alt baglam hicbir sey parse etmeden basarili olmali. Basarili
+# olursa sorunun rc ICERIGINDE oldugu kesinlesir; olmazsa sorun init'in
+# alt baglam mekanizmasinda demektir.
+#
+# KAYIP: vendor servisleri (audio, sensor, wifi...) tanimlanmaz. Bu
+# Zygote/SystemServer hedefi icin kabul edilebilir; asil yol bu anahtari
+# 1 yapip alt baglamin neden patladigini bulmak.
+VRC=0
+log "  VENDORRC=$VRC (0 = vendor rc agaci bilerek bos)"
+  # --- EVR-L29: Remove 'critical' from all services so init doesn't crash
+  # when a service fails to link. Also comment out exec_start apexd-bootstrap
+  # which can hang if apexd fails to link.
+  if [ -f "$SRC/init.rc" ]; then
+    sed -i 's/^    critical$/    # critical/' "$SRC/init.rc" 2>/bb/nb/null
+    sed -i 's/^    exec_start apexd-bootstrap$/    # exec_start apexd-bootstrap/' "$SRC/init.rc" 2>/bb/nb/null
+    m "### EVR-L29: Removed critical from init.rc services ###"
+  fi
+  if [ -f "$SRC/init.zygote64_32.rc" ]; then
+    sed -i 's/^    critical$/    # critical/' "$SRC/init.zygote64_32.rc" 2>/bb/nb/null
+    m "### EVR-L29: Removed critical from init.zygote64_32.rc ###"
+  fi
+
+# --- ADIM 1: rc agacini kopyala (dizin seviyesinde) -------------------------
+# DIKKAT: dosya dosya bind-mount 216 ayri 'mount' demek; her biri busybox
+# fork'u, TCG altinda ~0.3 sn -> 80 saniye. Butun rc agacini kopyalayip
+# DIZIN olarak bind-mount ediyoruz: 216 mount -> ~7 mount.
+for d in /system/etc/init /vendor/etc/init /odm/etc/init /cust/etc/init \
+         /system_ext/etc/init /product/etc/init /hw_product/etc/init; do
+  [ -d "$d" ] || continue
+  if [ "$VRC" = "0" ] && [ "$d" = "/vendor/etc/init" ]; then
+    # Dizin yine de baglanir ama BOS olur: firmware'in vendor rc'si
+    # gizlenir, alt baglam hicbir sey bulamaz.
+    mkdir -p "$OVL$d" 2>/bb/nb/null
+    echo "$d" >> "$ROOTS"
+    continue
+  fi
+  mkdir -p "$SRC$d" 2>/bb/nb/null
+  cp -a "$d/." "$SRC$d/" 2>/bb/nb/null || continue
+  echo "$d" >> "$ROOTS"
+done
+
+# --- ADIM 2: TEK awk gecisi -------------------------------------------------
+# DIKKAT: awk'ye dosyalari ARGUMAN olarak veriyoruz (boru hatti degil).
+# Boru hattinda FILENAME 'stdin' olur ve cikti dosyasi kaybolur.
+# Dosya adlarinda bosluk yok; yalnizca EROFS yollari.
+FILES=$(find "$SRC" -name '*.rc' | sort)
+NFILE=$(/bb/echo "$FILES" | /bb/grep -c '\.rc$')
+
+#  (1) service satirlarindan sonra stdout/stderr -> /dev/kmsg
+#  (2) 'wait <yol> [sures]'  -> 'wait <yol> 0'   (tek seferlik kontrol)
+#  (3) 'mount_all ... modem' -> yorum satiri
+#
+# DIKKAT (2) NEDEN: init'in 'wait' komutu dosya belirinceye kadar bekler.
+# QEMU'da Kirin modem yolu ASLA belirmiyor:
+#     init: wait for '/sys/devices/platform/balong_mloader/modem_start'
+#           timed out and took 30010ms
+#     init: Command 'mount_all /vendor/etc/fstab.modem --early' ...
+#           took 80257ms and succeeded
+# Yani 110 saniye modem olmayan cihaz icin gidiyordu ve init 'post-fs'
+# asamasini bitiremedigi icin class main (Zygote) hic baslamiyordu.
+# 'wait ... 0' tek bir kontrol demek: dosya yoksa ANINDA basarisiz olur.
+#
+# DIKKAT (2b) 'wait' satirinin timeout'u OLMADIGI durumda (orn
+# 'wait /dev/rfile') sifir ekliyoruz; yoksa sonsuza kadar bloklar.
+#
+# DIKKAT (3) NEDEN: /vendor/etc/fstab.modem dort wait bayrakli partition
+# tanimliyor. formattable oldugu icin fs_mgr once mount, sonra format
+# deniyor ve 80 saniye harcıyor. Modem QEMU'da hicbir zaman calismayacak.
+#
+# DIKKAT: awk "print expr > dosya" ile yazarken dosya ilk acildiginda
+# KIRPILIR, sonraki yazmalarda EKLENIR -- istedigimiz sey. Ama cikti dizini
+# olusturulmazsa yazma sessizce basarisiz olur; o yuzden dizin degistiginde
+# bir kez mkdir -laniyor (dosya sirali oldugu icin ~7 kez).
+#
+# !!! DIKKAT: BU BLOKTAN SONRAKI YORUMDA TEK TIRNAK KULLANMA !!!
+# awk programi shell'in TEK tirnakli dizisi icinde yaziliyor. Yorum
+# satirindaki bir kesme isareti diziyi ERKEN kapatir ve uretilen betik
+# sozdizimi hatasi verir:
+#     bb/rclog: line 104: syntax error near unexpected token `$0'
+# Bu tuzak iki kez basina geldi (bind-mount'lari, apexd-yi).
+#
+# This block is part of the same awk program: no apostrophes allowed.
+# !!! DIKKAT: -v OVL=$OVL TEK BASINA YETMEZ !!!
+# FILENAME $SRC ile BASLIYOR (/overlay-src/system/etc/init/hw/init.rc).
+# "out = OVL FILENAME" yazarsak cikti su adrese gider:
+#     /overlay-rc/overlay-src/system/etc/init/hw/init.rc
+# ama mount etmeye calistigimiz yer:
+#     /overlay-rc/system/etc/init/hw/init.rc
+# Aradaki /overlay-src farki tum bind-mountlari sessizce basarisiz
+# yapiyor (kosuda "baglanan : 0 rc dizini, 3 basarisiz" olarak gorduk).
+# Duzeltme: once SRC onekini kirp, sonra OLV ekle.
+# --- DEGISKENLI IMPORT'LARI SOMUTLASTIR (2026-10-16, L4 KOK NEDENI) ----------
+# SORUN: asagidaki awk kurali, '${' iceren BUTUN import satirlarini
+# yorumluyordu. Bu kural vendor connectivity ALT BAGLAMI oldurmek icin
+# konulmusdu (satir 655-672), ama yan tesir olarak su satirlari da
+# oldurdurdu:
+#     import /system/etc/init/hw/init.${ro.zygote}.rc     <-- ZYGOTE!
+#     import /init.${ro.hardware}.rc
+#     import /vendor/etc/init/hw/init.${ro.hardware}.rc
+# OLCULEN SONUC (adb shell uzerinden, 2026-10-16):
+#     [ro.zygote]: [zygote64_32]
+#     ls /system/etc/init/hw/init.zygote64_32.rc  -> VAR
+#     setprop ctl.start zygote
+#       -> "Failed to set property 'ctl.start' to 'zygote'"
+# Yani init 'zygote' SERVISINI TANIYAMIYOR, cunku tanimi hic yuklenmedi.
+# Daha once sadece ust duzey *.rc dosyalarina bakildigi icin (hw/ bir
+# ALT DIZIN) bu import'un yorumlandigi fark edilmemisti.
+#
+# COZUM: init'in cozumleme zamanina birakmayip degeri prop dosyalarindan
+# OKUYUP yolu somutlastiriyoruz. Boylece zamanlama belirsizligi kalir.
+#
+# DIKKAT: ozelligin hangi DOSYADA oldugunu varsaymiyoruz. Ilk denemede
+# yalnizca /system/build.prop'a baktik ve 'ro.zygote=YOK' cikti; oysa
+# getprop 'ro.zygote=zygote64_32' donuyor. Olcum:
+#     grep -rn "ro.zygote" /system/etc/prop.default /system/etc/*.prop \
+#         /vendor/build.prop /system/build.prop
+#     /vendor/build.prop:146:ro.zygote=zygote64_32
+# Yani deger /vendor/build.prop'ta. Asagidaki tarama sirayla hepsine
+# bakar ve ILK tanimi alir -- init ile ayni kural ('ro.' salt-okunur,
+# ilk tanim kazanir).
+propof() {
+  for f in /system/build.prop /vendor/build.prop /odm/etc/build.prop \
+           /cust/build.prop /r/system/build.prop /r/vendor/build.prop \
+           /system/etc/prop.default ; do
+    [ -f "$f" ] || continue
+    v=$(/bb/sed -n "s/^$1=//p" "$f" 2>/bb/nb/null | /bb/head -1)
+    if [ -n "$v" ]; then echo "$v"; return 0; fi
+  done
+  # DIKKAT (COZUM 2026-10-16, L4 8. KOK NEDEN): 'ro.hardware'
+  # prop DOSYALARINDA YOK; cekirdek komut satirindan geliyor:
+  #     Kernel command line: ... androidboot.hardware=qemu
+  #     getprop ro.hardware -> qemu
+  # Ama donanima ozel rc dosyasi kirin9000:
+  #     /vendor/etc/init/hw/init.kirin9000.rc   VAR
+  #     /vendor/etc/init/hw/init.qemu.rc        YOK
+  # Yani ${ro.hardware} -> qemu -> olmayan dosya -> import
+  # basarisiz ve TUM donanim rc agaci yuklenmiyor:
+  #     7: import /init.environ.rc
+  #     9: # RCYAMALAMA: import /init.${ro.hardware}.rc
+  #    10: # RCYAMALAMA: import /vendor/etc/init/hw/init.${ro.hardware}.rc
+  #    12: import /system/etc/init/hw/init.zygote64_32.rc
+  # Olcut: stok ust servis 122, init tarafindan TANImlanan 38.
+  # servicemanager, ueventd, hwservicemanager ve yuzlerce servis
+  # hic yuklenmemisti.
+  # COZUM: degeri tahmin etmeyelim; diskteki dosyadan TURETILIM.
+  if [ "$1" = "ro.hardware" ]; then
+    for f in /vendor/etc/init/hw/init.*.rc; do
+      [ -f "$f" ] || continue
+      b=${f##*/}; b=${b#init.}; b=${b%.rc}
+      [ "$b" = "zygote32" ] && continue
+      echo "$b"; return 0
+    done
+  fi
+  return 1
+}
+# DIKKAT (EVR-L29): ro.zygote prop dosyalarda yok, androidboot.zygote
+# kernel komut satirindan geliyor ama propof() dosyalardan okur.
+# Hardcode edelim:
+RO_ZYG="zygote64_32"
+RO_HW=$(propof ro.hardware)
+log "  cozulen    : ro.zygote=${RO_ZYG:-YOK} ro.hardware=${RO_HW:-YOK}"
+# Yalnizca hedefi GERCEKTEN var olan importlari etkinlestir; yoksa init
+# 'Failed to import' der (zararsiz ama gurultu yaratir).
+[ -n "$RO_ZYG" ] && [ -f "$SRC/system/etc/init/hw/init.$RO_ZYG.rc" ] || RO_ZYG=""
+log "  zygote.rc  : ${RO_ZYG:-yok} (hedef var mi: $([ -n "$RO_ZYG" ] && echo EVET || echo HAYIR))"
+/bb/awk -v OVL="$OVL" -v SRC="$SRC" -v ZYG="$RO_ZYG" -v HW="$RO_HW" '
+  function iswait(l) { return (l ~ /^[ \t]*wait[ \t]+/) && (l !~ /^[ \t]*#/) }
+  function ismodem(l) { return (l ~ /mount_all/) && (l ~ /modem/) && (l !~ /^[ \t]*#/) }
+  FNR == 1 {
+    rel = FILENAME
+    sub("^" SRC, "", rel)
+    out = OVL rel
+    dir = out
+    sub(/\/[^\/]*$/, "", dir)
+    if (dir != prevdir) { system("mkdir -p \"" dir "\""); prevdir = dir }
+    apexd = 0
+  }
+  ismodem($0)          { print "# RCYAMALAMA: " $0 > out; nm++; next }
+  # DIKKAT (COZUM 2026-10-15): DIKKAT once AYRI YAZILMISTI ve sadece
+  # apexd=1 diyordu -- satiri basmiyordu. Sonuc: apexd-bootstrap
+  # tanimi PATCHED rc dosyasinda HIC BELIRMIYORDU, init bu servisi
+  # tanimlamiyor ve servis hic baslamiyordu (logda starting service
+  # satiri yok).
+  # Tek kural, iki is: satiri bas + stdio ekle + apexd isaretle.
+  #
+  # DIKKAT (HATA 2026-10-15): "stdout /dev/kmsg" + "stderr /dev/kmsg"
+  # YAZIYORDUK. Bu init surumunde BOYLE BIR SECENEK YOK:
+  #     init: /vendor/etc/init/android.hardware.atrace@1.0-service.rc: 20:
+  #           Invalid keyword [stdout]
+  #     init: /vendor/etc/init/android.hardware.bluetooth@1.1-service.rc: 2:
+  #           Invalid keyword [stdout]
+  #     init: Subcontext exited with status 1
+  # Alt baglam (vendor_init) parse hatasinda CIKIYOR, yani
+  # /vendor/etc/init altindaki HICBIR servis tanimlanmiyor. Zincir:
+  #     vendor_init olmuyor -> start hwservicemanager calismiyor
+  #     -> on fs: wait_for_prop hwservicemanager.ready asili kalir
+  #     -> post-fs-data hic baslamaz -> class main tetiklenmez
+  #     -> zygote hic baslamaz
+  # Yani "gorusurluk icin ekledim" dedigimiz satirlar hicbir seyi
+  # gostermiyormus, sadece alt baglami komple dusuruyormus.
+  #
+  # DOGRU SECENEK: stdio_to_kmsg. init ikilisindeki string listesinde var
+  # (satir 2025) ve FIRMWAREIN KENDI rc dosyalari kullaniyor
+  # (hw/init.rc -> boringssl_self_test32). Logda bu anahtar icin
+  # [Invalid keyword] cikmiyor. Tek satirla stdout VE stderr ikisini birden
+  # kmsg uzerine bagliyor.
+  /^[ \t]*service[ \t]+/ {
+    apexd = ($0 ~ /service[ \t]+apexd-bootstrap[ \t]/)
+    svc = $2
+    print > out
+    print "    stdio_to_kmsg" > out
+    # DIKKAT (COZUM 2026-10-16, L4 4. KOK NEDEN): app_process
+    # calistiren HER servisin ortamina ANDROID_* ekleniyor.
+    #
+    # OLCULEN HATA: zygote su mesajla ABORT ediyor:
+    #   F DEBUG: Abort message: ANDROID_DATA environment variable unset
+    # Elle baslatilip cikti yakalandiginda
+    #   (export ANDROID_DATA=/data ANDROID_ROOT=/system) ile
+    #   app_process64 -Xzygote ... HATASIZ calisiyor
+    # yani zygote saglam, sadece ortam eksik.
+    #
+    # OLCUM (setenv kapsami): init.environ.rc icinde
+    #   on early-init
+    #       setenv ANDROID_DATA /data
+    # yazmistik ve ISLE YAPMADI. Cunku init "setenv" komutunu
+    # SERVIS BLOGUNUN ICINDE kullanir; orada o servisin ortamina
+    # eklenir. Kanit ayni dosyada duruyor:
+    #   service adbd ...
+    #       setenv LD_LIBRARY_PATH /apex/com.android.adbd/lib64
+    # ve adbd gercekten
+    #   LD_LIBRARY_PATH=/apex/com.android.adbd/lib64
+    # ile calisiyor. Buna karsi "on" aksiyonundaki setenv
+    # servis ortamina GECMIYOR:
+    #   tr \0 \n < /proc/<logd>/environ
+    #   -> PATH, CUST_POLICY_DIRS, DOWNLOAD_CACHE, ANDROID_SOCKET_*
+    #      ama LD_LIBRARY_PATH ve ANDROID_DATA YOK.
+    #
+    # Kapsam: satiri app_process gecen her servis (zygote,
+    # zygote_secondary, arkinit, mygote vb.). Hepsi ayni hatayi
+    # veriyordu: logcat icinde hem "--socket-name=zygote" hem
+    # "--socket-name=arkinit" icin ANDROID_DATA abortu vardi.
+    if ($0 ~ /app_process/) {
+      print "    setenv ANDROID_DATA /data" > out
+      print "    setenv ANDROID_ROOT /system" > out
+      print "    setenv ANDROID_RUNTIME_ROOT /apex/com.android.art" > out
+      print "    setenv ANDROID_TZDATA_ROOT /apex/com.android.tzdata" > out
+      print "    setenv ANDROID_IOTA_ROOT /apex/com.android.iota" > out
+      nenv++
+    }
+    next
+  }
+  # DIKKAT: apexd-bootstrap "critical" idi. Servicemanager bir sebepten
+  # 127 ile cikip onrestart ile apexd servisini yeniden baslatiyor; apexd
+  # de bizim mount ettigimiz /apex gorunce "0 packages" deyip kapaniyor ve
+  # critical oldugu icin init TUM sistemi kapatiyor:
+  #     init: Service "servicemanager" (pid 1009) exited with status 127
+  #     apexd: Unmount all subcommand detected
+  #     apexd: 0 packages restored.
+  #     reboot: "bootloader,bootstrap-apexd-failed"
+  # Emulatorda APEX KENDIMIZ bagliyoruz; apexd olmadan da sistem ayaga
+  # kalkiyor. Bu bayragi kaldirmak, apexd coktugunde sistemin geri
+  # kalaninin yasamaya devam etmesini sagliyor.
+  #
+  # DIKKAT: BU YORUMDA TEK TIRNAK KULLANMA. awk programi shell TEK
+  # tirnakli dizisi icinde; bir kesme isareti diziyi erken kapatir ve
+  # uretilen betik sozdizimi hatasi verir:
+  #     bb/rclog: line 99: syntax error near unexpected token dollar-0
+  # DIKKAT (COZUM 2026-10-15): rebootun GERCEK kaynagi bulundu.
+  # Firmware rc dosyasi (system/etc/init/apexd.rc) soyle diyor:
+  #     service apexd-bootstrap /system/bin/apexd --bootstrap
+  #         oneshot
+  #         disabled
+  #         reboot_on_failure reboot,bootloader,bootstrap-apexd-failed
+  # ve hw/init.rc de:
+  #     on early-init
+  #         exec_start apexd-bootstrap
+  # Yani init, apexd-bootstrap bir sey dondurunce KENDISI sistemi
+  # kapatiyor. Daha once bu yuzden apexd-bootstrap tanimindaki
+  # "critical" bayragini kaldirmistik; BU YANLIS KADRAI YARIMDI,
+  # cunku kritik degil, reboot_on_failure tetikliyordu.
+  # init kaynakli oldugu icin bu bayrak kalinca reboot KACINILMAZ.
+  #
+  # Emulator politikasi: TEK bir servisin cokmesi butun emulatoru
+  # dusurmesin. reboot_on_failure satirlari yorum haline getirilir
+  # ve hangi servisler icin kaldirildigi RAPORLANIR. Boylece
+  # gozlem yapabiliriz; uretim cihazinda bu kural gecerli degildir.
+  /^[ \t]*reboot_on_failure[ \t]/ {
+    print "# RCYAMALAMA(reboot kapali): " $0 > out
+    print "    # servis: " svc > out
+    nrf++; next
+  }
+  # "shutdown critical" de ayni kapiyi acar (shutdown sirasinda
+  # kritik servisler varsa init onlari da durdurup bekler).
+  /^[ \t]*shutdown[ \t]+critical[ \t]*$/ {
+    print "# RCYAMALAMA(shutdown kapali): " $0 > out
+    print "    # servis: " svc > out
+    nsc++; next
+  }
+  # DIKKAT: "writepid" satirlari /dev/cpuset, /dev/blkio, /dev/cpuctl,
+  # /dev/stune gibi cgroup dugumlerine yaziyor. BU CEKIRDEKTE O DUGUMLER
+  # YOK (cgroup: Unknown subsys name schedtune). Satiri yoruma almak
+  # zararsiz; servis kaydi bozulmaz, sadece surec yazma izni kaybolur.
+  /^[ \t]*writepid[ \t]/ {
+    print "# RCYAMALAMA(cgroup yok): " $0 > out
+    nwp++; next
+  }
+  # DIKKAT (COZUM 2026-10-15): BU SATIR vendor_init alt baglamini
+  # OLDURUYOR.
+  #   import /vendor/etc/init/connectivity/init.connectivity.${ro.boot.odm.conn.chiptype}.rc
+  # init bu yolu ozellikle COZER. ro.boot.odm.conn.chiptype bir BOOTLOADER
+  # ozelligi; firmwarein bes bolumundeki TUM .prop dosyalari tarandi ve
+  # HICBIR YERDE tanimli degil (bkz. _erofs-findprop.sh). Yani genisleme
+  # bos stringe duser ve init şu dosyayi arar:
+  #     /vendor/etc/init/connectivity/init.connectivity..rc
+  # o da yok -> "Failed to import" -> ALT BAGLAM CIKIYOR:
+  #     init: Subcontext exited with status 1
+  # ve /vendor/etc/init altindaki 102 dosyanin hicbiri tanimlanmiyor.
+  # (Bu dizinde 7 cip-spesifik dosya var: bcm43455, bcm4359, bcm43xx,
+  #  gps, hi1103, hi1105, hisi -- hangisinin dogru oldugunu firmware
+  #  bize SOVMUYOR, o yuzden tahmin etmiyoruz.)
+  #
+  # Bizim icin bu servislerin hicbir anlami yok: QEMU altinda ne WiFi ne
+  # Bluetooth ne GPS donanimi yok. Import satiri yorumlanir; kaybettigimiz
+  # sadece connectivity servisleri.
+  # DIKKAT (COZUM 2026-10-16): Bu kural YALNIZCA gercekten cozulemeyen
+  # degiskenli import satirlarini yorumlar. Once bilinen iki ozelligi
+  # SOMUT yola ceviriyoruz (ro.zygote, ro.hardware) -- bunlar
+  # build.prop dosyasinda GERCEKTEN tanimli ve hedef dosyalar diskte var
+  # (olculerek dogrulandi). Satir 12 deki zygote import satiri bu
+  # sayede KURTARILDI; oncesi durum:
+  #     setprop ctl.start zygote -> "Failed to set property"
+  /^[ \t]*import[ \t]+.*[$][{]/ {
+    ln = $0
+    if (ZYG != "") { gsub(/[$][{]ro\.zygote[}]/, ZYG, ln) }
+    if (HW  != "") { gsub(/[$][{]ro\.hardware[}]/, HW, ln) }
+    # DIKKAT (DUZELTME 2026-10-16): vendor tarafi bilerek BOS
+    # birakilir. Satiri basinda not: "VENDORRC=0 (0 = vendor rc agaci
+    # bilerek bos)". Once donanim import u COZULMEDIGI icin bu
+    # gecerliydi; simdi cozulunca vendor alt baglami 100+ dosyayi
+    # PARSE etmeye calisiyor ve sistemi cokertiyor:
+    #     init: Subcontext exited with status 1
+    #     init: Service ueventd (pid 4173) exited with status 1
+    #     init: critical process ueventd exited 4 times before
+    #           boot completed  -> boot DONUYOR
+    # System tarafi (/init.kirin9000.rc) ACIK kalir; servicemanager,
+    # hwservicemanager ve yuzlerce servis oradan geliyor.
+    if (ln ~ /^[ \t]*import[ \t]+\/vendor\//) {
+      print "# RCYAMALAMA(vendor rc bilerek bos): " $0 > out
+      nimp++; next
+    }
+    if (ln !~ /[$][{]/) {
+      print ln > out
+      nimpok++; next
+    }
+    print "# RCYAMALAMA(import cozulemedi, yorumlandi): " $0 > out
+    nimp++; next
+  }
+  # "file <yol> <mod>" servise acilis fd verir. /dev/kmsg erisimi
+  # SELinux erisimine tabi; alt baglamda sorun cikarabilir. Bizim ihtiyacimiz
+  # yok, cunku zaten stdio_to_kmsg ile her servisin ciktisini aliyoruz.
+  /^[ \t]*file[ \t]+\// {
+    print "# RCYAMALAMA(fd kaldirildi): " $0 > out
+    nfl++; next
+  }
+  # DIKKAT: BU SATIR BOGU ACIYOR. init, APEX verisi yuklendi bayragini
+  # SADECE perform_apex_config komutuyla kaldirir ve o komut yalnizca
+  # burada, "apexd.status == activated" olduktan SONRA cagrilir:
+  #     on post-fs-data
+  #         wait_for_prop apexd.status activated
+  #         perform_apex_config
+  # apexd normal modda kendini baslatip APEXleri aktiflestirmeye
+  # calisiyor ama QEMU altinda "0 packages restored" deyip basarisiz
+  # oluyor.
+  # Biz APEXleri KENDIMIZ bagladik ve ld.config.txt dosyasini 26 yolla
+  # yamladik, yani istenen durum zaten saglandi; beklemenin bir
+  # anlami yok. Bu yuzden bekleme yerine durumu elle veriyoruz. Sonuc:
+  # init, netd gibi updatable servisleri "Queued for execution"
+  # diye birakmak yerine BASLATIYOR:
+  #     init: Cannot start an updatable service netd before configs
+  #           from APEXes are all loaded.
+  /^[ \t]*wait_for_prop[ \t]+apexd\.status[ \t]+activated[ \t]*$/ {
+    print "    setprop apexd.status activated  # RCYAMALAMA: bekleme yerine elle" > out
+    nap++; next
+  }
+  apexd && /^[ \t]*critical[ \t]*$/ { nc++; next }
+  /^[ \t]*$/ { apexd = 0 }
+  # DIKKAT: kalan critical servisleri RAPORLA. init, critical bir servis
+  # coktugunde sys.powerctl ayarlar ve sistem KAPANIR:
+  #     init: Got shutdown_command reboot,bootloader,bootstrap-apexd-failed
+  # Bu blok bize hangi servis oldugunu soyler. Onceki kosuda
+  # apexd-bootstrap satiri temizlendikten SONRA da shutdown gelmeye
+  # devam etti; demek ki BASKA bir critical servis var.
+  # Satiri SILMIYORUZ (bu blok yalnizca sayar), sadece yorum olarak
+  # isaretliyoruz ki logda hangileri kaldigini gorelim.
+  # DIKKAT (2026-10-16, DENEME #1 BAŞARISIZ): once init in KENDI
+  # linkerconfig calistirmasini tumden yorumlamayi denedik. SONUC:
+  # config HIC OLUSMADI --
+  #     ### DGN global adbd: grep: /linkerconfig/ld.config.txt:
+  #       No such file or directory
+  # ve adbd dusersiz kaldi (CANNOT LINK / CANNOT CONNECT).
+  # Sebep: bizim yamamiz ORIJINAL dosyayi okuyup ustune yaziyor;
+  # dosyayi URETEN sey init in linkerconfig iydi. Yorumlayinca
+  # kaynak da yok oldu.
+  # GERI ALINDI. Dogru yol: init yazsin, biz yedek alip kendi
+  # halimizi geri yukleyelim (fix_ldconfig).
+  # DIKKAT (DUZELTME 2026-10-16): bu kural YANLISLIKLA silinmisti;
+  # geri konuldu. Sonra da dar kaldi: yalnizca TAM OLARAK "critical"
+  # yazan satirlari yakaliyordu. Parametreli olanlar KACIYORDU:
+  #     critical window=${zygote.critical_window.minute:-4}
+  #                          target=zygote-fatal
+  # Logda 11 servis critical olarak kaliyordu.
+  #
+  # ETKI (olculdu): critical bir servis 4 kez coktugunda init TUM
+  # bootu BIRAKIYOR:
+  #     init: Service ueventd (pid 3574) exited with status 1
+  #     init: critical process ueventd exited 4 times before
+  #           boot completed
+  # ve sistem NABIZ#0 da DONUYOR (supervise disinda hicbir surec).
+  # Bu, projenin en bastan beri kabul edilen politikaya aykiridir:
+  # hicbir servis tek basina sistemi kapatmamali.
+  # COZUM: tum critical bayraklarini kaldir. Servis yine
+  # yeniden baslatilir, ama init vazgecip bootu BIRAKMAZ.
+  # DIKKAT (COZUM 2026-10-16, L4 10. KOK NEDEN): /linkerconfig
+  # UZERINE baglanan satiri iptal et.
+  #
+  # /system/etc/init/hw/init.rc:68
+  #     mount none /linkerconfig/bootstrap /linkerconfig bind rec
+  #
+  # OLCULEN ETKI: /proc/mounts icinde /linkerconfig IKINCI KEZ
+  # mount edilmis gorunuyor:
+  #     tmpfs /linkerconfig tmpfs rw,seclabel,...
+  #     tmpfs /linkerconfig tmpfs rw,seclabel,...   <- ustunu kapatti
+  # Biz dosyayi IKINCI mountun kokune yaziyoruz; ama daha eski bir
+  # mount namespaceinde calisan surecler (ornegin vendor alt
+  # baglami) BIRINCI, yani BOS mountu goruyor. Sonuc:
+  #     W linker : failed to find generated linker configuration
+  #                from "/linkerconfig/ld.config.txt"
+  #     F linker : CANNOT LINK EXECUTABLE "/r/system/bin/init":
+  #                library "libc.so" not found
+  # Dosya diskte VAR ve dogru (ls + head ile dogrulandi, 15 sn
+  # boyunca degismiyor) ama linker acamiyor.
+  #
+  # DIKKAT: "bind rec" OZYINULEMELI oldugu icin /linkerconfig
+  # kendi alt dizinine baglanir. Bu yuzden iptal ediyoruz.
+  # Biz zaten /linkerconfig/ld.config.txt, /linkerconfig/bootstrap/
+  # ve /linkerconfig/default/ altina ATOMIK olarak yaziyoruz.
+  /^[ \t]*mount[ \t]+none[ \t]+\/linkerconfig/ {
+    print "# RCYAMALAMA(linkerconfig bind rec iptal): " $0 > out
+    nbind++; next
+  }
+  # DIKKAT (HATA DUZELTMESI 2026-10-17, L4): bu kural satiri
+  # YORUMLAMIYORDU, sadece altina bir yorum ekliyordu:
+  #     print > out                    <- satir AKTIF kalir
+  # OLCULEN ETKI (init ciktisi):
+  #     init: critical process ZYGOTE exited 4 times before boot
+  #            completed
+  # Yani critical bayragi hala gecerliydi. init.zygote*.rc icinde:
+  #     critical window=${zygote.critical_window.minute:-4}
+  #              target=zygote-fatal
+  # 4 dakika siniri dolunca zygote-fatal hedefi tetiklenir
+  # (guc kesme). Emulator politikamiz: HICBIR servis tek basina
+  # sistemi kapatmamali. Bu yuzden satiri gercekten yorumluyoruz.
+  /^[ \t]*critical([ \t]|$)/ {
+    print "    # RCYAMALAMA(critical kaldirildi): " $0 > out
+    print "    # CRITICAL-KALIYOR: " svc > out
+    crit++; next
+  }
+  iswait($0) {
+    l = $0
+    sub(/[ \t]+$/, "", l)
+    if (l ~ /[ \t][0-9]+$/) sub(/[ \t][0-9]+$/, "", l)
+    print l " 0" > out
+    nw++
+    next
+  }
+  { print > out }
+  END { printf "%d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", NR, nw, nm, nc, crit, nrf, nsc, nap, nwp, nfl, nimp, nimpok, nenv, nbind }
+' $FILES > /tmp/rclog.stats 2>/bb/nb/null
+
+STATS=$(/bb/cat /tmp/rclog.stats 2>/bb/nb/null)
+NOWAIT=$(/bb/echo "$STATS" | /bb/awk '{print $2+0}')
+NOMODEM=$(/bb/echo "$STATS" | /bb/awk '{print $3+0}')
+NOCRIT=$(/bb/echo "$STATS" | /bb/awk '{print $4+0}')
+NCRIT2=$(/bb/echo "$STATS" | /bb/awk '{print $5+0}')
+NREBOOT=$(/bb/echo "$STATS" | /bb/awk '{print $6+0}')
+NSHUT=$(/bb/echo "$STATS" | /bb/awk '{print $7+0}')
+NAPEXW=$(/bb/echo "$STATS" | /bb/awk '{print $8+0}')
+NWPID=$(/bb/echo "$STATS" | /bb/awk '{print $9+0}')
+NFLD=$(/bb/echo "$STATS" | /bb/awk '{print $10+0}')
+NIMP=$(/bb/echo "$STATS" | /bb/awk '{print $11+0}')
+NIMPOK=$(/bb/echo "$STATS" | /bb/awk '{print $12+0}')
+# DIKKAT: NIMPOK 0 ise zygote import'u YINE yorumlanmis demektir.
+# Bu sayac sifirken "cozulen ro.zygote" logu yalan soyleyebilir.
+[ "${NIMPOK:-0}" -eq 0 ] && log "  [UYARI] hicbir import somutlastirilamadi (zygote yine yok)"
+NENV=$(/bb/echo "$STATS" | /bb/awk '{print $13+0}')
+# DIKKAT: NENV 0 ise hicbir app_process servisine ANDROID_DATA
+# verilmedi demektir; zygote "ANDROID_DATA environment variable
+# unset" ile abort eder. Sayac olcum aracinin parcasidir.
+log "  android_env: $NENV app_process servisi icin eklendi"
+NBIND=$(/bb/echo "$STATS" | /bb/awk '{print $14+0}')
+# DIKKAT: linkerconfig bind rec iptal edilmediyse /linkerconfig
+# iki kez mount edilir ve bazi surecler bos olani gorur.
+[ "${NBIND:-0}" -eq 0 ] || log "  linkerconfig bind rec: $NBIND satirda iptal EDILDI (dogru)"
+
+# --- ADIM 3: dogrula ve dizin olarak bagla ---------------------------------
+# DIKKAT: init ilk asamada rc parse edemezse TUM sistem duser. Yedek ag:
+#  - kopyalanan agac ozgulinin TAMAMI olmali (eksik dosya = eksik servis)
+#  - servis sayisi degismemis olmali
+#  - sonra bind-mount
+sumsvc() { /bb/grep -rhcE '^[ \t]*service[ \t]' $1 2>/bb/nb/null | /bb/awk '{s+=$1} END{print s+0}'; }
+SVCA=$(sumsvc "$SRC")
+SVCB=$(sumsvc "$OVL")
+if [ "${SVCB:-0}" -ne "${SVCA:-0}" ] || [ "${SVCA:-0}" -eq 0 ]; then
+  log "  [HATA] servis sayisi uyusmadi (kaynak=$SVCA yamalimis=$SVCB) -> BIND-MOUNT YAPILMADI"
+  exit 1
+fi
+
+PATCHED=0; FAILED=0
+while read -r d; do
+  [ -n "$d" ] || continue
+  if [ ! -d "$OVL$d" ]; then
+    log "  [HATA] $d: yamalimis agac yok ($OVL$d) -> bind-mount yapilmadi"
+    FAILED=$((FAILED+1)); continue
+  fi
+  a=$(find "$d" -type f | wc -l)
+  b=$(find "$OVL$d" -type f | wc -l)
+  if [ "$a" -ne "$b" ]; then
+    log "  [HATA] $d: dosya sayisi tutmadi (kaynak=$a yamalimis=$b) -> atlandi"
+    FAILED=$((FAILED+1)); continue
+  fi
+  # DIKKAT: mount hatasinin metnini yaziyoruz. '2>/bb/nb/null' ile yutulursa
+  # neden basarisiz oldugunu ogrenmenin YOLU kalmaz; bir sonraki kosu
+  # ayni seyi ayni sekilde basarisiz yapar.
+  if e=$(mount -o bind "$OVL$d" "$d" 2>&1); then
+    PATCHED=$((PATCHED+1))
+  else
+    log "  [HATA] $d: mount -o bind basarisiz -> ${e:-bilinmiyor}"
+    FAILED=$((FAILED+1))
+  fi
+done < "$ROOTS"
+
+log "  rc dosyasi : $NFILE ($SVCA servis)"
+log "  baglanan   : $PATCHED rc dizini, $FAILED basarisiz"
+log "  wait->0    : $NOWAIT (Kirin modem beklemesi kaldirildi)"
+log "  modem off  : $NOMODEM (mount_all ... modem yorum satiri)"
+log "  critical-  : $NOCRIT (apexd-bootstrap critical bayragi kaldirildi)"
+log "  critical?  : $NCRIT2 servis daha critical (yorum olarak isaretli)"
+log "  reboot_kpl : $NREBOOT reboot_on_failure satiri yorumlandi (emulator)"
+log "  shutdown_k : $NSHUT shutdown critical satiri yorumlandi"
+log "  apexd.stat : $NAPEXW adet bekleme -> setprop apexd.status activated"
+log "  writepid   : $NWPID satır yorumlandi (cgroup dugumu yok)"
+log "  file fd    : $NFLD satır yorumlandi (/dev/kmsg erisimi)"
+log "  import     : $NIMP degiskenli import yorumlandi (alt baglami olduruyordu)"
+if [ "${NCRIT2:-0}" -gt 0 ]; then
+  # DIKKAT: bu listeyi satir satir basmak YANLIS. 11 satir ardisik
+  # yazildiginda kernel bunlari toplu "suppressed" diye yutuyor:
+  #     printk: rclog: 10 output lines suppressed due to ratelimiting
+  # ve hicbir servis adini goremiyorduk. Tek satir, kesilmis.
+  CL=$(/bb/grep -rh 'CRITICAL-KALIYOR' "$OVL" 2>/bb/nb/null \
+       | /bb/sed 's/^ *# *CRITICAL-KALIYOR: *//' \
+       | /bb/sort -u | /bb/tr '\n' ' ')
+  log "  kritik    : ${CL:0:300}"
+fi
+log "--- RC YAMALAMA HAZIR ---"

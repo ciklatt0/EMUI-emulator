@@ -1,0 +1,731 @@
+#!/bb/sh
+# ---- HarmonyOS emu: bolumleri bagla, Android init'e devret ----
+export PATH=/bb:/sbin:/bin:/usr/bin:/usr/sbin
+
+mkdir -p /sys/fs/selinux
+mount -t proc     proc     /proc  2>/bb/nb/null
+# DIKKAT: /dev icin devtmpfs KULLANIYORUZ. Bos tmpfs denendi ve
+# KIRMADI: bizim kendi init'imiz /dev/console ve /dev/null'a ihtiyac
+# duyuyor; bos /dev onu susturuyor (Run /init as init process
+# sonrasi hic cikti gelmiyor).
+#
+# DIKKAT: CONFIG_DEVTMPFS_MOUNT=y oldugu icin kernel /dev'i boot
+# aninda mount ediyor ve /dev/null hazir geliyor; init birinci
+# asmada mknod ile tekrar olusturmaya calisiyor ve Huawei bunu
+# EEXIST'ye olduruyor. Bu, asagidaki guvenlik agi ile izleniyor.
+mount -t devtmpfs devtmpfs /dev   2>/bb/nb/null
+mount -t tmpfs    tmpfs    /tmp   2>/bb/nb/null
+
+# --- CIKTI KANALI (G1 DUZELTMESI 2026-10-15) --------------------------------
+# DIKKAT: kernel komut satirinda
+#     console=ttyAMA0,115200 console=tty0
+# yazili. Coklu 'console=' verildiginde /dev/console EN SON konsola
+# (yani tty0'a) baglanir. Kernel mesajlari iki konsola da gider (log
+# doluyor), ama BU scriptin echo ciktilari SADECE pencereye gider.
+# draw_screen de her 2 saniyede '\033[H\033[2J' ile ekrani temizledigi
+# icin o cikti bir saniye sonra yok oluyor.
+#
+# KANIT: log'da 'HARMONYOS BOOT' banner'i HIC YOK; buna karsilik
+# supervise'in '/dev/kmsg'ye yazdigi '### /apex tazelendi' satirlari VAR.
+# Yani butun teÅŸhis ciktisi kameraya gidiyor, dosyaya degil.
+#
+# Cozum: stdout/stderr'i /dev/kmsg'ye yonlendir. kmsg TUM konsollara
+# yazilir (hem ttyAMA0 seri loga, hem tty0 penceresine) -- hicbir sey
+# kaybolmaz, sadece TEKRAR olur. kmsg acilamazsa /dev/console'a duser.
+# Cozum: stdout/stderr'i bir DOSYAYA yonlendir, denetleyici kmsg'e
+# dokunesrate sinirinin ALTINDA bosalt. kmsg TUM konsollara yazilir
+# (hem ttyAMA0 seri loga, hem tty0 penceresine).
+#
+# DIKKAT (2026-10-15): once dogrudan /dev/kmsg'ye yaziyorduk ve
+# cikti KAYBOLUYORDU. Temiz kosunun logunda /init'in butun govdesi
+# yok; sadece alt sureclerin ciktisi var:
+#     [ 3.441773] linkerconfig: Failed to scan APEX modules   (alt surec)
+#     ( DENEY, ANDROID INIT BASLATILIYOR, prop.default ... YOK )
+#     printk: init: 40 output lines suppressed due to ratelimiting
+#
+# NEDEN: cekirdekte
+#     kernel/printk/printk.c:  DEFINE_RATELIMIT_STATE(printk_ratelimit_state, 5*HZ, 10)
+#     include/linux/ratelimit.h: pr_warn("%s: %d output lines suppressed ...")
+# limit 5 saniye / 10 satirdir ve komut satirindaki
+# 'printk_ratelimit=1000000' BU CEKIRDEKTE HIC TANIYLI DEGIL
+# (core_param tanimi yok) -- sessizce yok sayiliyor.
+# Bizim surec adimiz "init" oldugu icin (/init betigi) baskilayan
+# cagri noktasi bize ait sayiliyor ve satirlarimiz atiliyor.
+#
+# COZUM: /init kmsg'ye HIC yazmaz. Bir dosyaya yazar; denetleyici her
+# saniye en fazla 3 satiri kmsg'e bosaltir. Boylece hicbir sey kaybolmaz
+# ve hicbir sey limiti tetiklemez.
+INITLOG=/bb/init.out
+: > "$INITLOG" 2>/bb/nb/null
+# Write to BOTH /bb/init.out AND /dev/kmsg so we can see debug output in boot log
+# exec output goes to console (console=ttyAMA0,115200)
+echo "### /init cikti kanali -> $INITLOG + /dev/kmsg ###"
+
+# --- binderfs ----------------------------------------------------------------
+# DIKKAT: kernel'imizde CONFIG_ANDROID_BINDERFS=y. Bu ayarla binder, klasik
+# /dev/binder misc dugumu olarak DEGIL, binderfs dosya sistemi icinde
+# (/dev/binder/binder, /dev/binder/hwbinder, ...) olarak sunulur. Binderfs
+# KULLANICI tarafindan mount edilmedikce hicbir binder dugumu gorunmez:
+#     ls: /dev/binder*: No such file or directory
+#     ProcessState: Opening '/dev/binder' failed: No such file or directory
+#
+# Bu olmadan Zygote, servicemanager, HAL'lar ve uygulama sureclerinin hicbiri
+# calismaz -- hepsi binder uzerinden konusur.
+#
+# DIKKAT: /dev/binder'e mount EDEMIYORUZ, cunku init /dev'in UZERINE kendi
+# tmpfs'ini mount edince kaybolur. Bunun yerine /devblk/binder'a mount
+# edip, init /dev'i degistirdikten sonra oraya bind ediyoruz (denetleyici).
+#
+# DIKKAT: kernel'i CONFIG_ANDROID_BINDERFS=n ile derledigimiz icin binderfs
+# mount EDMIYORUZ -- /dev/binder zaten bir karakter cihaz olarak gelir ve
+# mountapex'te /devblk'ye baglanir. (Onceki bir denemede bu blok varken
+# shell sozdizimi bozuldu: if satiri silinip 'else'/'fi' orphans kalmisti ->
+# '/init: line 26: syntax error: unexpected "else"')
+# /sys'i ve selinuxfs'i BIZ mount ETMIYORUZ. Denendi: mount edersek init
+# "Device or resource busy" aliyor ve BU Ã–LÃœMCÃœL:
+#   init: mount("sysfs","/sys",...) failed Device or resource busy
+#   init: Init encountered errors starting first stage, aborting
+# SELinux'u permissive kilitleme ise asagidaki gozlemci suresi icinde,
+# selinuxfs belirir belirmez yapilir.
+# /sys'i BIZ mount etmiyoruz: init birinci asamada kendisi mount ediyor ve
+# biz mount edersek "Device or resource busy" hatasi aliyor.
+# (SELinux'u kilitlemek icin birakiyoruz; asagida gerekirse yine de
+#  mount ediyoruz.)
+
+echo ""
+echo "================================================================"
+echo "  HARMONYOS BOOT  ->  init  ->  apexd  ->  Zygote"
+echo "================================================================"
+echo "kernel: $(uname -r)"
+echo "binder: $(grep -c binder /proc/devices 2>/bb/nb/null || echo 0) kayit"
+ls /dev/binder* 2>/bb/nb/null | sed 's/^/  /'
+echo ""
+
+mount_boot() {   # $1=partno $2=hedef $3=etiket
+  local dev="/dev/vda$1"
+  [ -b "$dev" ] || { echo "  [$3] $dev YOK"; return 1; }
+  if mount -t erofs "$dev" "$2" 2>/bb/nb/null; then
+    echo "  [$3] $dev -> $2   basarili"; return 0
+  fi
+  echo "  [$3] $dev -> $2   BASARISIZ"; return 1
+}
+
+echo "--- bolumler baglaniyor (EROFS) ---"
+# Disk sirasi bizim kurdugumuz sirayla:
+#   1=system 2=hw_product 3=vendor 4=odm 5=cust
+mount_boot 1 /r           "rootfs"
+mount_boot 2 /hw_product  "hw_product"
+mount_boot 3 /vendor      "vendor"
+mount_boot 4 /odm         "odm"
+mount_boot 5 /cust        "cust"
+
+# --- /data: kullanici verisi -------------------------------------------------
+# DIKKAT (2026-10-15): vold ARIA SUREKLI cokuyordu:
+#     vold: Check failed: android::vold::sBlkidContext != nullptr
+#     init: starting service 'vold'...        (25 kez)
+# Sebep: /data HIC YOK. Disk imajimizin 26 bolumunun hicbiri userdata
+# degil (5 sistem + 21 APEX). vold blkid'de userdata ariyor, bulamiyor ve
+# CHECK FAIL ile oluyor.
+# Sonrasi: 'init_user0' basarisiz -> zygote hic baslamaz:
+#     init: Failure (reboot suppressed): init_user0_failed
+# Yani zygotenin onundeki SON buyuk engel /data.
+#
+# Cozum: 80-build-bootdisk.sh bir ext4 data.img uretip EN SON bolum olarak
+# ekliyor (su an 29). Burada onu /devblk/vda29 uzerinden /data altina
+# bagliyoruz.
+# DIKKAT: bolum numarasi KALICI DEGIL; disk duzeni degisirse burasi da
+# degismeli. Yanlis numara bir APEX bolumunu /data'ya baglar ve vold
+# yine cokmeye devam eder.
+DATADEV=/devblk/vda29
+# DIKKAT (2026-10-15): burasi KOSUL ARASINDA mesaj yazmiyordu; /devblk
+# dugumu hazir olmadiginda HICBIR SEY gorunuyordu ve nedenini
+# tahmin etmek zorunda kaldik. Artik her durumda yaziyoruz.
+mkdir -p /data 2>/bb/nb/null
+if [ -b "$DATADEV" ]; then
+  if mountpoint -q /data 2>/bb/nb/null; then
+    echo "  /data: zaten bagli ($DATADEV)"
+  elif mount -t ext4 -o rw "$DATADEV" /data 2>/bb/nb/null; then
+    echo "  /data: $DATADEV baglandi (rw)"
+  else
+    echo "  /data: $DATADEV MOUNT BASARISIZ"
+  fi
+else
+  echo "  /data: $DATADEV blok cihaz degil (vold cokmeye devam eder)"
+fi
+echo ""
+
+if [ -d /r/system/bin ]; then
+  # DIKKAT (COZUM 2026-10-16, L4 11. KOK NEDEN): /system artik
+  # SYMLINK DEGIL, GERCEK MOUNT NOKTASI.
+  #
+  # SORUN (olculdu):
+  #     /system -> /r/system   (ls -ld /system)
+  # Boylece ikililerin GERCEK yollari /r/system/bin/... oluyor ve
+  # linker config bolumu ikilinin YOLUNE gore secildigi icin
+  # /r/system/... HICBIR bolumle eslesmiyor (eslesenler: /system/,
+  # /vendor/, /apex/<ad>/). Bos (default) bolum -> hic arama yolu:
+  #     F linker: CANNOT LINK EXECUTABLE "/r/system/bin/init":
+  #                library "libc.so" not found
+  #     F linker: "/system/bin/audioserver": libandroidicu.so not
+  #                found: needed by /r/system/lib64/libmedia.so
+  # Yani tek bir symlink yuzunden 47 hatada 23 tanesi oluyor.
+  #
+  # COZUM: /system dizinini gercek mount noktasi yap ve
+  # /r/system'i UZERINE bind et. Boylece yollar /system/... olur,
+  # [system] bolumu dogru secilir ve diger butun duzeltmelerimiz
+  # (APEX yollari, permitted.paths) de ise yarar.
+  #
+  # DIKKAT: bind mount basarisiz olursa symlink'e DUSULUR (eski
+  # davranis) -- sistem yine acilir, sadece bu duzelme olmaz.
+  rm -f /system 2>/bb/nb/null
+  rmdir /system 2>/bb/nb/null
+  mkdir -p /system 2>/bb/nb/null
+  if mount -o bind /r/system /system 2>/bb/nb/null; then
+    echo "  /system: /r/system bind mount olarak baglandi"
+  else
+    ln -sfn /r/system /system
+    echo "  /system: bind BASARISIZ, symlink eklendi (eski yol)"
+  fi
+  for l in bin sbin etc lib lib64 usr; do
+    if [ -e "/r/system/$l" ]; then
+      rm -f "/$l" 2>/bb/nb/null
+      rmdir "/$l" 2>/bb/nb/null
+      ln -sfn "/system/$l" "/$l"
+    fi
+  done
+  rm -f /lib 2>/bb/nb/null; rmdir /lib 2>/bb/nb/null
+  ln -sfn /system/lib64 /lib
+  echo "--- /system baglandi ---"
+  echo "  binary : $(ls /system/bin 2>/bb/nb/null | wc -l)"
+  echo "  init   : $(readlink /system/bin/init 2>/bb/nb/null)"
+  /bb/echo "### EVR-L29: reaching linker64 fix ###"
+  # --- EVR-L29: Fix linker64 symlink ---------------------------------------
+  # /system/bin/linker64 is a symlink to /apex/com.android.runtime/bin/linker64,
+  # but that file doesn't exist on the EROFS partition. /system/bin/bootstrap/
+  # linker64 IS a real file (1.5 MB). Copy it over the broken symlink so
+  # servicemanager and all dynamically-linked binaries can run.
+  # MUST run AFTER /system is bind-mounted (above), otherwise the mount covers
+  # our overlay. MUST run BEFORE exec init so servicemaker sees it.
+  /bb/echo "### EVR-L29: checking /system/bin/bootstrap/linker64 ###"
+  if [ -f /system/bin/bootstrap/linker64 ]; then
+    /bb/echo "### EVR-L29: bootstrap/linker64 FOUND ###" >/dev/kmsg 2>&1
+    mkdir -p /system-bin-tmp 2>/bb/nb/null
+    cp -a /system/bin/* /system-bin-tmp/ 2>/bb/nb/null
+    rm -f /system-bin-tmp/linker64 2>/bb/nb/null
+    cp /system/bin/bootstrap/linker64 /system-bin-tmp/linker64 2>/bb/nb/null
+    mount -o bind /system-bin-tmp /system/bin/ 2>/bb/nb/null       && /bb/echo "### EVR-L29: linker64 bind-mount via /system/bin/ overlay ###" >/dev/kmsg 2>&1
+    /bb/echo "### EVR-L29: linker64 bind-mount DONE ###"
+  else
+    /bb/echo "### EVR-L29: ERROR: bootstrap/linker64 NOT FOUND! ###"
+  fi
+
+else
+  echo "  [HATA] /r/system yok -- bolumler duzgun baglanmadi"
+  exec /bb/sh
+fi
+echo ""
+
+# --- SELinux: DERLENEN politika yerine HAZIR politika ------------------------
+# DIKKAT BU ADIM PROJENIN EN ETKILI DUZELTMESI.
+#
+# Gercekte olusan:
+#     init: /vendor/etc/selinux/precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256
+#           exists but /system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256 doesn't
+#     init: Compiling SELinux policy
+#     SELinux: 48 adet "Context ... is not valid (left unmapped)"
+#
+# Yani init hazir politikayi KULLANAMIYOR ve kaynak .cil dosyalarindan
+# yeniden derliyor. Derlenen politika eksik cikiyor ve kritik baglamlar
+# tanimli degil. Sonuc (olcum):
+#     init: Service 'ueventd' ... exited with status 1     (critical!)
+#     init: Subcontext exited with status 1                 (vendor_init)
+#     starting service 'vendor.*-hal'  -> 0 tane
+# Yani Kirin HAL'larinin hicbiri baslamiyor.
+#
+# NEDEN eslesmiyor: Android 12'de init, vendor ve system_ext tarafinin
+# "bu policy ayni surumden mi" imzasini KARSILASTIRIR. Dosyalar ayniysa
+# hazir policy guvenle yuklenir. Bu firmware'de vendor tarafi var,
+# system_ext tarafi YOK. Dogrulandi: system.img icindeki /system_ext
+# dizini BOS, /etc/selinux/system_ext_... da hicbir yerde yok.
+# (Bu firmware'de super'da 5 dinamik partition var; system_ext ayri bir
+#  partition degil, bos bir dizin.)
+#
+# COZUM: eşleme dosyasini SENTEZLE. Icerik vendor kopyasinin aynisi
+# olmak zorunda (tek satirlik bir onaltilik hash). Boylece init
+# "ikisi de ayni" der ve hazir policy'yi yukler -- 48 baglam yerinde
+# kalir, ueventd ve vendor_init subcontext calisir.
+#
+# DIKKAT: bu bir aldatma degil. Politika zaten vendor icinde HAZIR ve
+# dogru; sadece init'in guven kontrolu icin gereken ikinci kopyayi
+# uretiyoruz. Cihazda ayni dosya system_ext partition'inda duruyor.
+VSHA=/vendor/etc/selinux/precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256
+mkdir -p /system_ext/etc/selinux
+if [ -f "$VSHA" ]; then
+  cp "$VSHA" /system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256 2>/bb/nb/null
+  if [ -s /system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256 ]; then
+    echo "--- SELinux ---"
+    echo "  hazir politika eslemesi SENTEZLENDI (init artik derlemeyecek)"
+    echo "  sha256: $(cat /system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256 2>/bb/nb/null | head -c 64)"
+  else
+    echo "--- SELinux ---"
+    echo "  [UYARI] esleme dosyasi kopyalanamadi -> politika yine derlenecek"
+  fi
+else
+  echo "--- SELinux ---"
+  echo "  [UYARI] $VSHA yok -> politika derlenmeye devam edecek"
+fi
+echo ""
+
+mkdir -p /data /data/local /data/system
+# DIKKAT (HATA DUZELTMESI 2026-10-16): bu mount HER cagrida kosulsuz
+# calisiyordu. mountapex supervisor dongusunde TEKRAR cagriliyor ve
+# her cagrida /data uzerine YENI (bos) tmpfs bind ediyordu.
+# OLCULEN ETKI:
+#   [ 96.2] ### /data dizinleri kuruldu (30. tur) ###
+#   [109.2] ### ctl.start zygote -> svc=running dcache=VAR ###
+#   ...
+#   bootfail: open [/data/system/dropbox] failed!  [No such file]
+#   bootfail: open [/data/tombstones] failed!
+#   init: critical process 'zygote' exited 4 times before boot completed
+# Yani dizinler kuruluyor, zygote bir sure ayakta kaliyor, sonra
+# mountapex tekrar cagrilinca /data SIFIRLANIYOR ve zygote dalvik-cache
+# bulamayip signal 6 ile cokuyor.
+# COZUM: yalnizca /data henuz mount edilmemisse mount et.
+#
+# DIKKAT (KOK NEDEN DUZELTMESI 2026-10-17): "mountpoint -q /data"
+# KORUMASI YETERSIZDI. /init'in kendi ext4 mount denemesi
+# (satir ~3144) BASARISIZ oluyor ve /data bir DIZIN kalip buraya
+# geliyor. Nedeni satir 214'te yazili:
+#     : > /devblk/vda29                       # bos dosya olustur
+#     mount -o bind /dev/vda29 /devblk/vda29 # /dev/vda29 YOK
+# OLCULEN KANIT (konukta):
+#     ls -l /dev/vda29    -> No such file or directory
+#     ls -l /devblk/vda29 -> brw------- 1 0 0 259, 13
+#                            (bunu sonradan ueventd yaratiyor;
+#                             mount aninda duz dosya)
+# Yani mount aninda [ -b ] testi basarisiz olur, ext4 mount HIC
+# denenmez ve biz buraya tmpfs ile geliriz. Oyleyse /data asla
+# gercek bolumu gormez ve vold kurulamaz:
+#     vold: Check failed: android::vold::sBlkidContext != nullptr
+#     bootfail: find log in [/data/system/dropbox] failed!
+#
+# OLCULEN GERCEK /data (elle mount edilince):
+#     /devblk/vda29 on /data type ext4 (rw,seclabel,relatime)
+#     icerik: lost+found  misc  system  user_de
+# Bolum saglam ve dolu. Dogru davranis: ONCE GERCEK BOLUMU dene,
+# ancak o da yoksa tmpfs'e dus.
+# DIKKAT: kontrolu "mount noktasi mi" degil "/data tmpfs mi"
+# UZERINDEN yapiyoruz; boylece gecici isimiz her turde gercek
+# bolumle degistirilir.
+# DIKKAT (IKINCI HATA DUZELTMESI 2026-10-17): ilk denemede burada
+# __DATADEV_PART__ yaziyordu. Ama o placeholder SADECE
+# bb/mountapex dosyasina ikame ediliyor (satir 421 ve 3744).
+# /init'e SADECE /devblk/vda29 ikame ediliyor (satir 3743).
+# O yuzden ilk surum var OLMAYAN bir yol ariyordu; denetleyici
+# gunlugunde mesajimiz hic gorunmedi (GERCEK BOLUM satiri bos
+# kaldi) ve /data yine tmpfs olarak kaldi. OLCULARAK ANLASILDI.
+# DOGRULU YOL: bu blok /init icinde oldugu icin DATADEV degiskenini
+# kullan (satir ~3139'da tanimli, sed ile /devblk/vda29 olur).
+DATASRC=
+for c in ${DATADEV:-} /devblk/vda__DATADEV_PART__; do
+  [ -n "$c" ] || continue
+  if [ -b "$c" ]; then DATASRC="$c"; break; fi
+done
+if [ -n "$DATASRC" ] && /bb/grep " /data " /proc/mounts 2>/bb/nb/null | /bb/grep -q "tmpfs"; then
+  if mount -t ext4 -o rw "$DATASRC" /data 2>/bb/nb/null; then
+    echo "### /data: gecici tmpfs -> GERCEK BOLUM ($DATASRC) ###"
+  else
+    echo "### /data: GERCEK BOLUM mount BASARISIZ ($DATASRC) ###"
+  fi
+fi
+if mountpoint -q /data 2>/bb/nb/null; then
+  echo "--- /data ---"
+  echo "  zaten mountlu, yeniden baglanmadi (icerik korunuyor)"
+else
+  mount -t tmpfs -o size=2G tmpfs /data 2>/bb/nb/null
+  echo "--- /data ---"
+  echo "  tmpfs baglandi"
+fi
+# DIKKAT: tombstoned ve bootfail bu dizinleri ZORUNLU istiyor; yoksa
+# her olayda 'open failed' yazip duruyorlar.
+for d in tombstones system system/dropbox system/packages misc \
+         local local/tmp app media media/0 user user/0 \
+         dalvik-cache dalvik-cache/arm dalvik-cache/arm64 \
+         dalvik-cache/x86 dalvik-cache/x86_64 ; do
+  mkdir -p "/data/$d" 2>/bb/nb/null
+done
+df -h /data 2>/bb/nb/null | tail -1
+echo ""
+
+# --- /cache -----------------------------------------------------------------
+# DIKKAT: /cache /system'in ICINDE (/system/cache) ve EROFS -> salt okunur.
+# init post-fs asamasinda orayi sahiplenmeye calisiyor ve HATA ALIYOR:
+#     init: Command 'chown system cache /cache' action=post-fs
+#           (init.rc:574) took 0ms and failed: lchown() failed: Read-only FS
+#     init: Command 'mkdir /cache/recovery 0770 system cache'
+#           took 4ms and failed: Read-only FS
+# Bu bir sonraki asamayi (post-fs-data -> class main -> ZYGOTE) bloklar.
+# Cozum: uzerine yazilabilir bir tmpfs bagla.
+mkdir -p /cache
+mount -t tmpfs -o size=64M tmpfs /cache 2>/bb/nb/null
+echo "--- /cache ---"
+df -h /cache 2>/bb/nb/null | tail -1
+echo ""
+
+# --- /metadata, /mnt/vendor, /odm_dlkm vb. -----------------------------------
+# DIKKAT: Huawei rc'leri bu yollari da sahiplenmeye calisiyor. Hepsi
+# /system altinda oldugu icin ayni sorun. Tek tek tmpfs baglamak yerine
+# hepsini bir dongude yapiyoruz; olmayanlari eklemek zararsiz.
+for d in /metadata /mnt/vendor /mnt/vendor/persist /odm_dlkm /vendor_dlkm \
+         /sdcard /storage/emulated /mnt/user /mnt/sdcard /second_stage_resources; do
+  mkdir -p "$d" 2>/bb/nb/null
+  mountpoint -q "$d" 2>/bb/nb/null && continue
+  mount -t tmpfs -o size=32M tmpfs "$d" 2>/bb/nb/null
+done
+echo "--- yazilabilir mount noktalari ---"
+echo "  tmpfs sayisi: $(grep -c ' tmpfs ' /proc/mounts 2>/bb/nb/null)"
+echo ""
+
+# --- /log ------------------------------------------------------------------
+# --- tracefs (2026-10-16) ---------------------------------------------------
+# OLCULEN BELIRTI: system_server fork ediyor ama hemen:
+#     E cutils-trace: Error opening trace file: No such file or
+#       directory (2)
+# ve ayrica tombstoned uyari veriyordu:
+#     Abort message: tracefs must be mounted at either
+#       /sys/kernel/tracing or /sys/kernel/debug/tracing
+# Bu ikinci mesaj bir vendor servisini (android.hardware.atrace) ABORT
+# ediyordu. Izinli yollara tracefs'i ekliyoruz; kernel'de
+# CONFIG_TRACING=FS_TRACE yazili (diger tracer ayarlari ile birlikte).
+if ! mountpoint -q /sys/kernel/tracing 2>/bb/nb/null; then
+  mkdir -p /sys/kernel/tracing 2>/bb/nb/null
+  mount -t tracefs nodev /sys/kernel/tracing 2>/bb/nb/null
+fi
+if [ -d /sys/kernel/tracing/events ]; then
+  echo "--- tracefs ---"
+  echo "  bagli: $(ls /sys/kernel/tracing/events 2>/bb/nb/null | wc -l) olay grubu"
+else
+  echo "--- tracefs ---"
+  echo "  [UYARI] baglanamadi (cutils-trace yine hata verecek)"
+fi
+
+# Huawei'nin 'bootfail' modulu kritik surec hatalarini /log altina yaziyor:
+#     bootfail: lstat [/log/critical_process_crash.txt] failed!
+# /log EROFS'te SALT OKUNUR bir dizin; uzerine tmpfs baglayarak yazilabilir
+# yapiyoruz. Duz olmasa da init'in sonraki adimlari (rapor yazma, yeniden
+# deneme) takilip kalabiliyor.
+mkdir -p /log
+mount -t tmpfs -o size=64M tmpfs /log 2>/bb/nb/null
+echo "--- /log ---"
+df -h /log 2>/bb/nb/null | tail -1
+echo ""
+
+# --- APEX: TAVUK-YUMURTA SORUNU --------------------------------------------
+# /system/bin/init'in KENDISI dinamiktir ve libc.so'ya APEX'ten ihtiyac
+# duyar:
+#     CANNOT LINK EXECUTABLE "/system/bin/init": library "libc.so" not found
+# Oysa APEX mount'unu init.rc'deki bir servisle yapsak, servis ancak
+# init calistikten SONRA tetiklenir -- init ise hicbir zaman baglanamaz.
+#
+# Gercek Android'de bu zincir ramdisk'teki AYRI bir first_stage init ile
+# cozulur; o /apex'i baglar, sonra /system/bin/init'i baslatir.
+#
+# Burada iki katman kuruyoruz:
+#   1) simdi (/init icinde)  -> init'in baglanabilmesi icin ZORUNLU
+#   2) init.rc early-init   -> init /apex'in USTUNE kendi tmpfs'sini
+#                              mount ederse yeniden baglar
+# Ikinci katman zararsiz: ayni cihazi ayni noktaya tekrar mount etmek
+# ust ustte mount yaratir ve oncekiyi gizler -- bu tam da istenen etki.
+# --- EVR-L29: ld.config.txt'i ANDROID INIT'TEN ONCE olustur --------------
+# Linker config'i exec init'DEN ONCE hazirlamak zorunlu; aksi halde
+# ilk servisler (ueventd, servicemanager, zygote) baglanamaz ve
+# init "Attempted to kill init" ile panik yapar.
+# APEX'ler mountapex ile zaten bagli; onlardan yollarini toplayip
+# ld.config.txt yaziyoruz.
+mkdir -p /linkerconfig 2>/bb/nb/null
+{
+  /bb/echo "# HARMONY-EMU bootstrap linker config"
+  /bb/echo "dir.system = /system/bin/"
+  /bb/echo "dir.system = /system/lib64/"
+  /bb/echo "dir.vendor = /vendor/bin/"
+  /bb/echo "dir.vendor = /vendor/lib64/"
+  /bb/echo ""
+  /bb/echo "[system]"
+  /bb/echo "namespace.default.isolated = false"
+  /bb/echo "namespace.default.visible = true"
+  /bb/echo "namespace.default.search.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64"
+  /bb/echo "namespace.default.permitted.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64"
+  for a in /apex/*/; do
+    [ -d "$a/lib64" ] || continue
+    lname=${a#/apex/}; case "$lname" in */) lname=${lname%/} ;; esac
+    /bb/echo "namespace.default.search.paths += /apex/$lname/lib64"
+    /bb/echo "namespace.default.permitted.paths += /apex/$lname/lib64"
+    if [ -d "$a/lib64/bionic" ]; then
+      /bb/echo "namespace.default.search.paths += /apex/$lname/lib64/bionic"
+      /bb/echo "namespace.default.permitted.paths += /apex/$lname/lib64/bionic"
+    fi
+  done
+} > /linkerconfig/ld.config.txt 2>/bb/nb/null
+echo "  ld.config.txt: $(grep -c '/apex/' /linkerconfig/ld.config.txt 2>/bb/nb/null) APEX yolu, $(wc -l < /linkerconfig/ld.config.txt 2>/bb/nb/null) satir"
+
+/bb/mountapex
+echo ""
+
+# --- DENEY: apexd'nin link adimini kendi /init icimizde tekrarla -------------
+# Chroot'ta ayni islem calisiyor (bootstrap linkerconfig ciktisi + /apex
+# mount) ama QEMU'da calismiyor. Farki init BASLAMADAN once olusturuyoruz:
+# once init'in kullanacagi bootstrap config'i uret, sonra apexd'yi bagla.
+# Boylece "apexd libc.so'yu neden bulamiyor" sorusu init olmadan yanitlanir.
+echo "--- DENEY: bootstrap linkerconfig + apexd baglama ---"
+mkdir -p /linkerconfig/bootstrap
+/system/bin/bootstrap/linkerconfig --target /linkerconfig/bootstrap 2>&1 | sed 's/^/    /'
+echo "    ld.config.txt /apex satiri: $(grep -c '/apex/' /linkerconfig/bootstrap/ld.config.txt 2>/bb/nb/null)"
+echo "    libc.so hedefi : $(readlink /system/lib64/libc.so 2>&1)"
+if ls -lL /system/lib64/libc.so >/bb/nb/null 2>&1; then
+  echo "    libc.so COZULUYOR (dosya sisteminde)"
+else
+  echo "    libc.so COZULMUYOR (dosya sisteminde)  <-- SORUN BURDA"
+fi
+echo "    apexd baglama denemesi:"
+/system/bin/linker64 --list /system/bin/apexd 2>&1 | tail -6 | sed 's/^/      /'
+echo "--- DENEY bitti ---"
+echo ""
+
+# --- DENETLEYICI -------------------------------------------------------------
+# exec ile PID 1 olunca bu betik kaybolur; o yuzden denetleyiciyi onceden
+# arka plana birakiyoruz. init onu devralir ve calismaya devam eder.
+# Gorevleri: /apex'i tazelemek (init uzerine tmpfs mount edip gizliyor) ve
+# SELinux'u permissive kilitlemek.
+setsid /bb/supervise &
+
+# --- /bb/supervise ----------------------------------------------------------
+# Arka planda calisan denetleyici. Iki isi var:
+#
+# 1) SELinux'u kalici PERMISSIVE birakmak.
+#    DIKKAT: selinuxfs'i /init icinde mount ETMEK yanlis -- init birinci
+#    asamada "Device or resource busy" alip OLUR:
+#      init: Init encountered errors starting first stage, aborting
+#    Dogru zaman, selinuxfs hazir olur olmaz ve init policy'yi yukledikten
+#    hemen sonra. enforce dosyasi SELinux pseudo-dosyasi; duz bir dosyaya bind
+#    mount edince init'in "1" yazmasi cekirdege ulasmaz.
+#
+# 2) /apex'i TAZELEMEK. Asil sorun bu. init (apexd-bootstrap) /apex'in
+#    UZERINE bos bir tmpfs mount ediyor; 22 APEX mount'u altta kaliyor ama
+#    gizleniyor:
+#      SNAP: apex=0  ama  /proc/mounts'ta 22 apex mount'u
+#    Sonuc: /system/lib64/libc.so -> /apex/com.android.runtime/.../libc.so
+#    symlink'i kirilir ve init'in baslattigi HER sey baglanamaz:
+#      apexd:  CANNOT LINK ... library "libc.so" not found
+#      init:   cannot execv('/system/bin/app_process64')   â† ZYGOTE
+#    Denetimcisi bir sefer yapip birakmiyor; /apex bosalirsa yeniden
+#    mount ediyor.
+echo "================================================================"
+echo "  ANDROID INIT BASLATILIYOR"
+echo "================================================================"
+echo ""
+
+# --- /bb/nb: yazilabilir bosluk (SALT OKUNUR KOKTEN SONRA) ------------------
+# DIKKAT (2026-10-15): init 'on post-fs' icinde kok dosya sistemini salt
+# okunur yapiyor:
+#     mount rootfs rootfs / remount bind ro nodev
+# O andan sonra /bb uzerine yazilamaz ve stderr yonlendirmelerimiz hata
+# verir:
+#     can't create /bb/nb/null: Read-only file system
+# Salt okunur bir dosya sisteminin ALT dizinine tmpfs baglamak serbesttir.
+mkdir -p /bb/nb
+mount -t tmpfs -o size=64k tmpfs /bb/nb 2>/bb/nb/null
+: > /bb/nb/null 2>/bb/nb/null
+echo "  /bb/nb: yazilabilir bosluk hazir ($(ls -l /bb/nb/null 2>/bb/nb/null | tr -s ' ' | cut -d' ' -f1,5,9))"
+export ANDROID_ROOT=/system
+export ANDROID_DATA=/data
+export ANDROID_STORAGE=/data
+export PATH=/system/bin:/system/sbin:/vendor/bin:/vendor/sbin:/bb
+export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/apex/com.android.runtime/lib64
+
+# --- EKSIK OZELLIK: ro.logsystem.usertype -----------------------------------
+# DIKKAT (2026-10-15): firmware'de /system/etc/prop.default DOSYASI YOK
+# (erofs'tan dogrulandi) ve init'in yukledigi TUM build.prop dosyalarinda
+# da su ozellik tanimli degil. Duzeltilmis tarayici ile BES bolumun
+# tamami tarandi (/system, /hw_product, /vendor, /odm, /cust):
+#     arama bitti: logsystem.usertype
+# Kontrol amacli ayni tarayici "ro." desenini denedi ve /vendor/build.prop
+# icinde 15+ ozellik buldu -- yani arac calisiyor, ozellik GERCEKTEN yok.
+#
+# init'e preload edilmis Huawei kitapligi (libhwcust_init) bu ozelligi
+# okuyor. vendor_init ALT BAGLAMI okuma hatasiyla STATUS 1 ile oluyor:
+#     audit: denied { read } for property=ro.logsystem.usertype
+#            scontext=u:r:vendor_init:s0 tclass=file
+#     init: Subcontext exited with status 1
+#
+# DIKKAT: once /system/etc/prop.default UZERINE bind-mount denedik; basarisiz
+# oldu, cunku hedef dosya YOK ve bind-mount olmayan bir yola baglanamaz:
+#     prop.default: bind BASARISIZ (ozellik tanimsiz kalir)
+# /system EROFS oldugu icin dosyayi da yaratamiyoruz.
+#
+# COZUM: build.prop dosyalarini kopyalayip EKLE satiri ekliyoruz ve
+# bind-mount ile GERCEK dosyanin UZERINE koyuyoruz. Hedef dosya VAR
+# oldugu icin bu calisir.
+mkdir -p /bb/prop
+NPROP=0
+for bp in /system/build.prop /vendor/build.prop /odm/build.prop \
+          /cust/build.prop /hw_product/build.prop; do
+  [ -f "$bp" ] || continue
+  mkdir -p "/bb/prop$(dirname "$bp")" 2>/bb/nb/null
+  cp "$bp" "/bb/prop$bp" 2>/bb/nb/null || continue
+  echo "ro.logsystem.usertype=0" >> "/bb/prop$bp"
+  # DIKKAT (2026-10-15, adbd'nin TCP DINLEYICISININ ACILMAMASI):
+  # Firmware "user" yapisi: ro.build.type=user -> ro.secure=1.
+  # adbd IsAdbSecure() ile ro.adb.secure'e bakar; o yoksa ro.secure'e
+  # bakar. 1 ise AUTH acar ve init'ten ANDROID_SOCKET_adbd fd'si
+  # bekler. Biz adbd'yi elle baslattigimiz icin o fd yok ve adbd
+  # baglantiyi KURULMADAN birakiyor:
+  #     adbd E auth.cpp:203] Failed to get adbd socket: Operation not permitted
+  # olcut (nabiz satiri): adbd=ayakta pid=2563 ama tcp5555=0
+  # Yani surec yasiyor, 5555'i DINLEMIYOR. Bu yuzden Windows adb
+  # "offline" diyor ve QEMU hostfwd baglantisi RST ile kapaniyor.
+  # COZUM: ro.adb.secure=0 -> auth hic acilmaz, dogrudan dinler.
+  # DIKKAT (2026-10-16, DUZELTME): firmware'in /system/build.prop'unda
+  # ZATEN 'ro.adb.secure=1' satiri var (olcduk: _tls-prop.sh). 'ro.'
+  # property'ler SALT-OKUNURDUR; property_service ILK tanimi kabul
+  # eder, sonrakileri GORMEZ. Yani dosyanin sonuna ekledigimiz
+  # 'ro.adb.secure=0' ETKISIZDI ve auth kapanmiyordu:
+  #     adbd E auth.cpp:203] Failed to get adbd socket: Operation not permitted
+  #
+  # COZUM: mevcut satirlari once YORUMLA, sonra temiz degeri yaz.
+  #
+  # DIKKAT (HATA, OLCUM): onceki surumde burada cift tirnakli 'sed'
+  # YAZIYDI:     sed -i 's/^ro\.adb\.secure=.*/# & .../'
+  # /init, /system mount EDILMEDEN once calisiyor. O anda PATH'te
+  # /system/bin YOK (erofs, icinde sed yok) ve initramfs'te de sed
+  # symlink'i yok -- komut "not found" olup 2>/bb/nb/null ile SESSIZCE
+  # basarisiz oluyordu. Kanit, bizim kendi dogrulama satirimizdi:
+  #     DIKKAT: /system/build.prop icinde ro.adb.secure hala ETKIN
+  # Duzeltme: busybox eklentisini ACIKCA adresle (/bb/sed).
+  #
+  # DIKKAT: sed'i ONCE calistir, temiz degerleri SONRA ekle; tersi
+  # olursa yeni yazdigimiz 0 degerini de yorumlamis oluruz.
+  # DIKKAT (2026-10-16, HATA 2): 'sed -i' BAYRAGINDAN VAZGECTIK.
+  # busybox 'sed -i' gecici dosyayi TMPDIR altina yazar. /init, /system
+  # mount edilmeden once calistigi icin TMPDIR bos ve /tmp henuz yok
+  # -- komut sessizce basarisiz olur (2>/bb/nb/null yuzunden gorunmez).
+  # Guvenli desen: acik gecici dosyaya yaz, sonra mv et. Hicbir gecici
+  # dizin gerektirmez. Tek geciste UC deseni birden.
+  /bb/sed -e 's/^ro\.adb\.secure=.*/#& # HARMONY-EMU: auth kapali/' \
+          -e 's/^ro\.secure=.*/#& # HARMONY-EMU: root adb serbest/' \
+          -e 's/^ro\.debuggable=.*/#& # HARMONY-EMU: debuggable/' \
+          "/bb/prop$bp" > /bb/nb/prop.fix 2>/bb/nb/null
+  if [ -s /bb/nb/prop.fix ]; then
+    /bb/mv -f /bb/nb/prop.fix "/bb/prop$bp" 2>/bb/nb/null
+  else
+    /bb/echo "  DIKKAT: $bp sed ciktisi BOS, yama uygulanmadi"
+  fi
+  echo "ro.adb.secure=0" >> "/bb/prop$bp"
+  echo "ro.secure=0" >> "/bb/prop$bp"
+  echo "ro.debuggable=1" >> "/bb/prop$bp"
+  # DIKKAT (GERI ALMA 2026-10-18): ro.ark.enable=0 DENEMESI ISE YARIMADI.
+# Kanitlar:
+#  1) Bu ROM'da zygote/arkinit AYNI ikili:
+#       service arkinit /system/bin/app_process64 -Xzygote /system/bin
+#                   --zygote --nice-name=arkinit
+#     ve /apex/com.android.art/bin/ icinde ikinci bir app_process
+#     YOK (stok AOSP'de com.android.art/bin/app_process64 vardir).
+#  2) ROM'da Ark runtime'inin TAMAMI var:
+#       /system/lib64/ark/libarkruntime.so  5.4 MB
+#       /system/framework/framework.abc   31 MB
+#       /system/framework/core-oj.abc  (64 adet .abc)
+#  3) dlopen izleyici (arac dogrulandi: calisan getprop'ta da
+#     gercek cagrilari yakaladi):
+#       app_process64 10 dlopen cagriyor, 0 basarisiz, HICBIRI
+#       libart icin degil; android_dlopen_ext hic cagrilmiyor.
+#       Yani Ark kapaliyken VM HIC OLUSMADI.
+#  4) persist.sys.hw.forcedark_policy=0 da TEK FARKI yaratmadi
+#     (once 10/0/0, sonra 10/0/0 -- birebir ayni).
+# SONUC: Ark yolu dogru olan yol. ro.* salt-okunur oldugu icin
+# (setprop ile degistirilemiyor) build.prop yamasindan KALDIRILIR
+# ve firmware degeri (1) birakilir.
+echo "# ro.ark.enable: HARMONY-EMU yaması kaldirildı, firmware degeri 1 birakildi"
+  # DIKKAT: yama gercekten tuttu mu? Iki kontrol:
+  #   (1) asil deger satirinin yorum icinde olmasi (sed calisti mi)
+  #   (2) temiz deger satirinin dosyanin SONUNDA olmasi (ro. ilk deger)
+  # (1) tutmazsa adbd auth'u kapanmaz, L5 gelmez. Olcum aracini
+  # dogrula kurali: yamanin calistigini iddia etmeden olc.
+  if /bb/grep -q '^#ro\.adb\.secure=' "/bb/prop$bp" 2>/bb/nb/null; then
+    /bb/echo "  prop: $bp -> ro.adb.secure YORUMLANDI (auth kapali)"
+  else
+    /bb/echo "  DIKKAT: $bp icinde ro.adb.secure yorumlanmadi (sed calismadi mi?)"
+  fi
+  # ro.ark.enable ARTIK YORUMLANMIYOR (2026-10-18'de geri alindi:
+  # bu ROM'da Ark yolu dogru olan yol). Firmware degeri (1)
+  # birakilir. Yine de olcuyoruz -- "yamalama kalkti" demek
+  # firmware'in degerini BOZMADIGIMIZ anlamina gelir.
+  if /bb/grep -q '^ro\.ark\.enable=1$' "/bb/prop$bp" 2>/bb/nb/null; then
+    /bb/echo "  prop: $bp -> ro.ark.enable=1 FIRMWARE DEGERI KORUNDU (Ark yolu acik)"
+  else
+    /bb/echo "  DIKKAT: $bp icinde ro.ark.enable=1 yok (beklenen: firmware degeri)"
+  fi
+  if mount -o bind "/bb/prop$bp" "$bp" 2>/bb/nb/null; then
+    NPROP=$((NPROP + 1))
+  fi
+done
+echo "  prop: ro.logsystem.usertype $NPROP build.prop dosyasina eklendi"
+
+# DIKKAT (2026-10-15): /apex/com.android.adbd/etc/init.rc icinde de
+# 'service adbd' tanimi var. Biz init.environ.rc'ye ayni tanimi
+# ekledik; ikisi de import edilirse init "duplicate service" hatasi
+# verip dosyayi TUMDEN reddeder -- bizim dosyamiz da mount_harmony_apex
+# ve harmony_diag servislerini tasiyor, onlar da kaybolur.
+# Cozum: APEX'inkini bosaltip kendimizinkini tek tanim birakiyoruz.
+if [ -f /apex/com.android.adbd/etc/init.rc ]; then
+  mkdir -p /bb/rc 2>/bb/nb/null
+  echo "# HarmonyOS emu: adbd servisi init.environ.rc'de tanimli." \
+    > /bb/rc/adbd-init.rc
+  if mount -o bind /bb/rc/adbd-init.rc /apex/com.android.adbd/etc/init.rc 2>/bb/nb/null; then
+    echo "  adbd: APEX init.rc nötralize edildi (bizim tanimimiz kullanilacak)"
+  fi
+fi
+
+cd /system 2>/bb/nb/null
+
+# --- SERVIS LOGLARI + MODEM KALDIRMA: rc agacini yamalayip bagla ------------
+# DIKKAT SIRA: bu 'exec init'TEN HEMEN ONCE olmak ZORUNDA. init rc
+# dosyalarini kendi ilk asamasinda PARSE ediyor; bizim bind-mount'umuz
+# ancak ondan sonra konusmaya baslar.
+#
+# DIKKAT: init kendi stdout'unu /dev/null'a cevirdigi icin (bu scriptin
+# ciktisi da gorunmez -- tek istisna init'in KENDI LOG() cagrilari
+# /dev/kmsg'ye gider) asagidaki cagri kendi ciktisini zaten /dev/kmsg'ye
+# yaziyor.
+/bb/rclog
+echo "--- rc yamalama bitti ---"
+
+# --- /dev/null gÃ¼venlik aÄŸÄ± (RC YAMALAMADAN SONRA) ---------------------------
+# DIKKAT: bu adim rclog'DAN SONRA olmak ZORUNDA. Ã–nceden buradaydÄ± ve
+# rclog 80 saniye sürüyor; o pencere içinde /dev/null yine bir DIZINE
+# dÃ¶nÃ¼ÅŸÃ¼yor ve init mknod'da EEXIST alÄ±p TÃœM sistemi dÃ¼ÅŸÃ¼rÃ¼yordu:
+#     init: mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3)) failed File exists
+#     init: Init encountered errors starting first stage, aborting
+#
+# DIKKAT: önceki hâli 'sadece dizinse kaldır' diyordu. Bu YETERLI DEGIL:
+# init'in ilk aÅŸamasÄ± mknod'u koÅŸulsuz dener ve EEXIST'i Ã–LÃœMCÃœL sayar.
+# Karakter cihazÄ± da olsa, kendisi yaratabilmesi iÃ§in yolu boÅŸaltÄ±yoruz.
+# Aradaki pencerede /dev/null'a ihtiyaÃ§ duyan tek ÅŸey yok (init milisaniye
+# sonra kendi doÄŸru dÃ¼ÄŸÃ¼mÃ¼nÃ¼ mknod'luyor).
+rm -f /dev/null 2>/bb/nb/null
+rmdir /dev/null 2>/bb/nb/null
+rm -rf /dev/null 2>/bb/nb/null
+if [ -e /dev/null ]; then
+  echo "--- [UYARI] /dev/null hala var, silinemedi: $(ls -ld /dev/null 2>&1) ---"
+else
+  echo "--- /dev/null temizlendi (init kendisi mknod'layacak) ---"
+fi
+
+# --- EVR-L29: Bind-mount patched servicemanager.rc over original -----------
+  # Override the minimal servicemanager.rc on EROFS with our patched version
+  # (class core/user/group added). This must be done BEFORE exec init so that
+  # init reads the patched version when parsing rc files.
+  if [ -f /servicemanager.rc ]; then
+    mount -o bind /servicemanager.rc /system/etc/init/servicemanager.rc 2>/bb/nb/null       && echo "### EVR-L29: servicemanager.rc bind-mount overlay applied ###"
+  fi
+
+
+exec /system/bin/init "$@"

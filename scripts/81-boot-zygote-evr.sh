@@ -190,6 +190,8 @@ service system_server /system/bin/app_process64 /system/bin --nice-name=system_s
     stdin /dev/null
     stdout /dev/kmsg
     stderr /dev/kmsg
+    onrestart restart surfaceflinger
+    onrestart restart bootanimation
 SS_EOF
     /bb/echo "### EVR-L29: system_server service added ###" >/dev/kmsg 2>&1
   fi

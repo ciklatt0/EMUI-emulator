@@ -1,0 +1,50 @@
+#!/bb/sh
+# Ciktiyi /dev/kmsg'e yaz. kmsg TUM konsollara yazilir (seri log + pencere).
+# DIKKAT: stdout'u kendimiz ceviriyoruz; init bu scripti bir SERVIS olarak
+# calistirir ve o zaman stdout /dev/null'a dusuyor.
+exec >/dev/kmsg 2>&1
+TAG="${1:-init oncesi}"
+emit() { /bb/echo "$1"; }
+sec() { emit ""; emit "--- $1 ---"; }
+emit ""
+emit "==========================================================="
+emit "  DIAG  [$TAG]   $(/bb/date 2>/bb/nb/null)"
+emit "==========================================================="
+
+sec "BOLUMLER"
+/bb/grep -E ' /(system|apex|vendor|odm|cust|hw_product|data|postinstall)[/ ]' /proc/mounts 2>/bb/nb/null | while read -r l; do emit "  $l"; done
+
+sec "APEX"
+emit "  modul sayisi      : $(/bb/ls /apex 2>/bb/nb/null | /bb/grep -c apex)"
+emit "  runtime modulu    : $([ -d /apex/com.android.runtime ] && /bb/echo VAR || /bb/echo YOK)"
+emit "  vndk.v31 takmasi  : $([ -d /apex/com.android.vndk.v31 ] && /bb/echo VAR || /bb/echo YOK)"
+emit "  apex-info-list.xml: $([ -f /apex/apex-info-list.xml ] && /bb/echo VAR || /bb/echo YOK)"
+emit "  apex mount (toplam): $(/bb/grep -c ' /apex/' /proc/mounts 2>/bb/nb/null)"
+
+sec "LINKER ZINCIRI  (apexd hatasi burada baslar)"
+emit "  /system/lib64/libc.so -> $(/bb/readlink /system/lib64/libc.so 2>&1)"
+if /bb/ls -lL /system/lib64/libc.so >/bb/nb/null 2>&1; then
+  emit "  libc.so COZULUYOR   : EVET ($( /bb/ls -lL /system/lib64/libc.so | /bb/awk '{print $5}') bayt)"
+else
+  emit "  libc.so COZULUYOR   : HAYIR   <-- 'library libc.so not found'"
+fi
+emit "  ld.config.txt       : $([ -f /linkerconfig/ld.config.txt ] && /bb/echo VAR || /bb/echo YOK)"
+emit "  APEX arama yollari  : $(/bb/grep -c '/apex/' /linkerconfig/ld.config.txt 2>/bb/nb/null)"
+/bb/grep -E '^namespace.default.search.paths' /linkerconfig/ld.config.txt 2>/bb/nb/null | while read -r l; do emit "    $l"; done
+
+sec "CIHAZLAR  (init /dev'i degistirince bunlar kayboluyor)"
+for d in binder hwbinder vndbinder loop-control vda1 vda6; do
+  emit "  /dev/$d      : $(/bb/ls -ld /dev/$d 2>&1 | /bb/sed 's#^/dev/##')"
+  emit "  /devblk/$d   : $(/bb/ls -ld /devblk/$d 2>&1 | /bb/sed 's#^/devblk/##')"
+done
+emit "  /dev toplam   : $(/bb/ls /dev 2>/bb/nb/null | /bb/wc -l) dugum"
+emit "  /dev/binder   : $([ -c /dev/binder ] && /bb/echo 'KARAKTER CIHAZI' || (/bb/echo 'yok/dizi' ))"
+
+sec "SELINUX"
+emit "  enforce : $(/bb/cat /sys/fs/selinux/enforce 2>&1)"
+
+sec "SERVISLER (calisan ilk 25)"
+/bb/ps 2>/bb/nb/null | /bb/head -25 | while read -r l; do emit "  $l"; done
+
+emit ""
+emit "==========================================================="

@@ -1,0 +1,1363 @@
+#!/bb/sh
+# HarmonyOS emu: /apex ve SELinux denetleyicisi.
+#
+# DIKKAT: bu script /init'ten setsid ile baslatilir, yani /init'in
+# stdout'unu (artik /dev/kmsg) devralir. Yine de KENDIMIZ ceviriyoruz:
+# script'i elle calistirmak istedigimizde (/bb/supervise) stdout duz
+# ekrana gider ve teÅŸhis kaybolur.
+exec >/dev/kmsg 2>&1
+m() { /bb/echo "$1"; }
+
+# --- adbd: L5'e en kisa yol (2026-10-15) -------------------------------------
+# DIKKAT: zygote/SystemServer yolu çok uzun ve vendor_init'a bagli.
+# Ama adbd TAMAMEN BAGIMSIZ bir ikilidir: framework, zygote, SurfaceFlinger
+# hicbiri gerekmez. Firmware rc'sinde tanimi:
+#     service adbd /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0
+#         class core
+#         socket adbd seqpacket 660 system system
+#         disabled
+# Yani 'disabled' ve USB tetikleyicilerine bagli; QEMU'da USB gadget
+# olmadigi icin HICBIR ZAMAN baslamaz. Ama adbd'nin TCP modu var:
+#     adbd tcp:5555
+# APEX'i biz bagliyoruz (/apex/com.android.adbd) ve QEMU'ya
+# 'hostfwd=tcp::5555-:5555' ekledik. Windows tarafinda adb.exe zaten
+# var (Android\Sdk\platform-tools), yani:
+#     adb connect 127.0.0.1:5555
+#     adb shell
+# ile GERCEK BIR SHELL acilir.
+#
+# DIKKAT: adbd ro.debuggable/ro.secure degerlerine bakar. Kernel komut
+# satirimizda androidboot.debuggable=1 ve androidboot.secure=0 var, yani
+# root erisimi mumkun olmali.
+# DIKKAT (COZUM 2026-10-15, adbd'nin ONCEKI ENGELI "libadb_protos.so"):
+#
+# Gozlem:
+#   linker: Warning: couldn't read config file
+#           "/apex/com.android.adbd/etc/ld.config.txt"
+#           for "/apex/com.android.adbd/bin/adbd"
+#   CANNOT LINK EXECUTABLE ...: library "libadb_protos.so" not found
+#
+# Yani link icindeki ikililer icin linker GLOBAL /linkerconfig/ld.config.txt
+# dosyasini DEGIL, APEX'e ozel <apex>/etc/ld.config.txt dosyasini okuyor.
+# Bizim 58 APEX yolu ekledigimiz global dosya bu yuzden adbd'ye hic yaramadi.
+# APEX'in kendi etc/ dizininde ld.config.txt YOK (yalnizca init.rc var) --
+# dogrulandi: com.android.adbd.apex acilip listelendi.
+#
+# Olcutulen arama yollari (readelf -d + erofs listesi):
+#   /apex/com.android.adbd/lib64  -> libadb_protos, libbase, libc++,
+#                                   libcrypto, libcutils, protobuf
+#   /system/lib64                 -> libadbd_fs.so, libadbd_auth.so,
+#                                   liblog.so, libselinux.so
+#   /apex/com.android.runtime/lib64/bonic -> libc, libm, libdl
+# Yani global config'i okuyan linkerde bu yolun TAMAMI zaten vardi ve
+# linker adbd icin sadece /apex/com.android.adbd/lib64'i kaybediyordu.
+adbd_ldconfig() {
+  # DIKKAT (ZAMANLAMA, 2026-10-15): bu fonksiyon supervisor'in
+  # dongusunde n>=3'te cagriliyor ama /apex/com.android.adbd O AN
+  # henuz mount edilmemis olabiliyor; o durumda '[ -x .../bin/adbd ]'
+  # kontrolu gecer ama 'mount -o bind .../etc' BAŞARISIZ olur ve
+  # fonksiyon bir daha DENEMEZ (dosya olmadigi icin ust satirdaki
+  # koruma da gecmez -- aslinda gecer, ama bind hatasini gordukten
+  # sonra surec cokmus oluyor).
+  # Olcut: "### adbd ld.config: bind BASARISIZ" n=3'te, sonraki
+  # kosularda da hep ayni. Cozum: APEX mount'unu bekle.
+  if [ ! -x /apex/com.android.adbd/bin/adbd ]; then
+    ld_wait=$(( ${ld_wait:-0} + 1 ))
+    return 0
+  fi
+  [ -f /apex/com.android.adbd/etc/ld.config.txt ] && return 0
+  mkdir -p /bb/nb/adbdld /bb/nb/adbdetc 2>/bb/nb/null || return 0
+  {
+    echo "dir.system = /system/bin/:/system/lib64/:/apex/com.android.runtime/lib64/bionic/:/apex/com.android.adbd/bin/:/apex/com.android.adbd/lib64/"
+    echo "dir.apex_com.android.adbd = /apex/com.android.adbd/bin/:/apex/com.android.adbd/lib64/"
+    echo ""
+    echo "[system]"
+    echo "namespace.default.search.paths = /system/bin:/system/lib64:/apex/com.android.runtime/lib64/bionic:/apex/com.android.adbd/lib64"
+    echo "namespace.default.interpreter = /system/bin/linker64"
+    echo "namespace.default.isolated = false"
+    echo "namespace.default.per_library_path = false"
+    echo ""
+    echo "[apex_com.android.adbd]"
+    echo "namespace.default.search.paths = /apex/com.android.adbd/bin:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.runtime/lib64/bionic"
+    echo "namespace.default.interpreter = /system/bin/linker64"
+    echo "namespace.default.isolated = false"
+    echo "namespace.default.per_library_path = false"
+  } > /bb/nb/adbdld/ld.config.txt 2>/bb/nb/null
+  [ -s /bb/nb/adbdld/ld.config.txt ] || return 0
+  # DIKKAT (2026-10-15 TEK SEFERLIK TEŞHİS): config yazildi ama linker
+  # uygulamiyor gibi. Elimizde sadece "ilk bulunamayan = libadb_protos.so"
+  # olgusu var ve bu IKI hipotezi ayirt edemiyor:
+  #   (a) linker config'i okumuyor/uygulamiyor (built-in default yollar:
+  #       /system/bin:/system/lib64:/apex/.../bonic)
+  #   (b) config uygulaniyor ama /apex/com.android.adbd/lib64 bos
+  # Ayirt edici olcut: /system/lib64'te libadbd_fs, liblog, libselinux,
+  # libbase, libc++, libcrypto, libcutils VAR; libadb_protos.so YOK.
+  # Yani "(a) dogrudan kanitli" -- ama emin olmak icin asagidakileri
+  # bir kez basilip bir daha silinmiyor (adbd_diag bayragi).
+  if [ "${adbd_diag:-0}" != "1" ]; then
+    adbd_diag=1
+    m "### DGN apex lib64 : $(/bb/ls /apex/com.android.adbd/lib64 2>&1 | /bb/tr '\n' ' ')"
+    m "### DGN libadb_pro: $(/bb/ls -l /apex/com.android.adbd/lib64/libadb_protos.so /system/lib64/libadb_protos.so 2>&1 | /bb/tr '\n' ' ')"
+    m "### DGN bizim cfg  : $(/bb/head -3 /bb/nb/adbdld/ld.config.txt 2>&1 | /bb/tr '\n' '|')"
+    m "### DGN global adbd: $(/bb/grep -n 'com.android.adbd' /linkerconfig/ld.config.txt 2>&1 | /bb/tr '\n' '|')"
+    m "### DGN apex etc   : $(/bb/ls /apex/com.android.adbd/etc 2>&1 | /bb/tr '\n' ' ')"
+  fi
+  # DIKKAT: /apex/com.android.adbd/etc dizini APEX'te SALT OKUNUR. Onun
+  # USTUNE dizin bind-mount edebiliriz (alt yazi sistemine yazmadan),
+  # ama o zaman altindaki init.rc gizlenir -- onu kopyaliyoruz.
+  cp /bb/nb/adbdld/ld.config.txt /bb/nb/adbdetc/ld.config.txt 2>/bb/nb/null
+  cp /apex/com.android.adbd/etc/init.rc /bb/nb/adbdetc/init.rc 2>/bb/nb/null
+  if mount -o bind /bb/nb/adbdetc /apex/com.android.adbd/etc 2>/bb/nb/null; then
+    m "### adbd ld.config: /apex/com.android.adbd/etc/ld.config.txt bind ile hazir (bekleme=${ld_wait:-0})"
+  else
+    ld_bad=$(( ${ld_bad:-0} + 1 ))
+    # DIKKAT: hata kalici degil. mount n=3'te basarisiz olabiliyor
+    # (APEX henuz bagli degil); bir sonraki turda tekrar deniyoruz.
+    [ "$ld_bad" -le 3 ] && m "### adbd ld.config: bind BASARISIZ (#$ld_bad, tekrar denenecek)"
+  fi
+  return 0
+}
+
+ensure_net() {
+  # DIKKAT: konukta eth0 var mi? /sys/class/net altinda arariz.
+  found=""
+  for i in /sys/class/net/*/; do
+    iname=${i#/sys/class/net/}; iname=${iname%/}
+    [ "$iname" = "lo" ] && continue
+    found="$iname"
+    break
+  done
+  if [ -z "$found" ]; then
+    [ "${net_said:-0}" = "1" ] && return 0
+    net_said=1
+    m "### net: /sys/class/net bos -- eth0 YOK, hostfwd calisamaz"
+    return 0
+  fi
+  # IP zaten varsa bir sey yapma (sadece bir kez yaz).
+  if [ "${net_ok:-0}" != "1" ]; then
+    /bb/ip addr add 10.0.2.15/24 dev "$found" 2>/bb/nb/null
+    /bb/ip link set "$found" up 2>/bb/nb/null
+    /bb/ip route add default via 10.0.2.2 dev "$found" 2>/bb/nb/null
+    /bb/ip addr show "$found" 2>/bb/nb/null | /bb/head -3 > /bb/nb/net.out 2>/bb/nb/null
+  fi
+  # Her turda dogrula; IP kaybolursa (link down) yeniden kur.
+  if /bb/ip -o addr show "$found" 2>/bb/nb/null | /bb/grep -q '10.0.2.15'; then
+    net_ok=1
+    return 0
+  fi
+  net_ok=0
+  /bb/ip addr add 10.0.2.15/24 dev "$found" 2>/bb/nb/null
+  /bb/ip link set "$found" up 2>/bb/nb/null
+  /bb/ip route add default via 10.0.2.2 dev "$found" 2>/bb/nb/null
+  [ "${net_said2:-0}" = "1" ] && return 0
+  net_said2=1
+  m "### net: $found hazirlandi 10.0.2.15/24 gw 10.0.2.2"
+  return 0
+}
+
+# --- L4: /data dizinleri + zygote -------------------------------------------
+# DIKKAT (OLCUM KAPANISI 2026-10-16): zygote elle baslatildiginda
+#     Error creating cache dir /data/dalvik-cache/arm64
+#         : No such file or directory
+#     Aborted
+# /data bizim tmpfs'imiz (2.0G) ve BOS. vold her 5 saniyede
+#     cokuyor: Check failed: android::vold::sBlkidContext != nullptr
+# ve icerigi kurulmuyor. Dalvik cache olmadan zygote ABORT ediyor.
+#
+# DIKKAT (neden init rc'sinde degil): 'on post-fs-data' tetigi
+# init'in fs_manager'indan gelir; /data'yi INIT degil BIZ mount
+# ettigimiz icin tetik HIC gelmiyor. Kanit: init.environ.rc'deki
+# 'on early-init' calisiyor (ro.crypto.state yazildi) ama
+# 'on post-fs-data' hicbir iz birakmiyor ve /data BOS kaliyor.
+# Bu yuzden dizinleri mount ettigimiz yere kuruyoruz.
+DATA_DIRS="dalvik-cache dalvik-cache/arm dalvik-cache/arm64
+dalvik-cache/x86 dalvik-cache/x86_64 system system/packages
+misc local local/tmp app media media/0 user user/0"
+ensure_data_dirs() {
+  # DIKKAT (DUZELTME 2026-10-16): bir kez "yapildi" bayragi koyuyorduk.
+  # Ama /data tmpfs'i sonradan yeniden baglanirsa dizinler SILINIYOR ve
+  # bayrak sayesinde bir daha kurulmuyordu:
+  #   bootfail: open [/data/system/dropbox] failed!
+  #   bootfail: open [/data/tombstones] failed!
+  # Artık her turda VARLIK kontrolu yapiyoruz (ucuz: tek test).
+  #
+  # -------------------------------------------------------------------
+  # DIKKAT (KOK NEDEN DUZELTMESI 2026-10-17): /data GERCEK BOLUMU
+  # ASLA GORMUYORDU; her zaman gecici bir tmpfs idi.
+  #
+  # /init'te (satir ~3300) gercek bolumu deniyoruz ama O AN
+  # /devblk/vda29 BIR BLOK CIHAZ DEGIL:
+  #     : > /devblk/vda29                       # /init'te duz dosya
+  #     mount -o bind /dev/vda29 /devblk/vda29 # /dev/vda29 YOK
+  # Gercek blok dugumunu UEVENTD koyuyor (olculdu:
+  #     brw------- 1 0 0 259, 13), yani /init'in /data blogundan
+  # SONRA. O blogu TEK SEFER calistigi icin asla denenmiyor.
+  # OLCULEN GERCEK /data (elle mount edilince):
+  #     /devblk/vda29 on /data type ext4 (rw,seclabel,relatime)
+  #     icerik: lost+found  misc  system  user_de
+  # ve elle mount BASARILI. Yani bolum saglam; sadece zamanlama
+  # yuzunden baglanmiyor.
+  #
+  # COZUM: bu fonksiyon supervisor DONGUSUNDE her tur calisiyor;
+  # gecici tmpfs'i gordugumuzde gercek bolumle degistiriyoruz.
+  # 29 yalnizca bb/mountapex'e ikame edildigi icin
+  # (bb/supervise'e EDILMEYDI) bu fonksiyona DA ikame ekliyoruz
+  # -- yoksa var olmayan bir yol aranir ve sessizce basarisiz olur.
+  # -------------------------------------------------------------------
+  if [ -b /devblk/vda29 ] \
+     && /bb/grep " /data " /proc/mounts 2>/bb/nb/null | /bb/grep -q tmpfs; then
+    if mount -t ext4 -o rw /devblk/vda29 /data 2>/bb/nb/null; then
+      dd_ok=0
+      m "### /data: gecici tmpfs -> GERCEK BOLUM (/devblk/vda29) ###"
+    fi
+  fi
+  # DIKKAT (2026-10-18): arkprobe servisi /data/dltrace.so ile
+  # baslatiliyor (bkz. init.environ.rc). dosyayi buraya kopyaliyoruz.
+  # DIKKAT: /bb/ hicbir linker namespace'ine uymuyor; oradan
+  # LD_PRELOAD edildiginde "libnativeloader.so not found" veriyor.
+  # /data dogru namespace'e dustugu icin calisiyor (olculdu).
+  if [ -f /bb/dltrace.so ] && [ ! -f /data/dltrace.so ]; then
+    /bb/cp /bb/dltrace.so /data/dltrace.so 2>/bb/nb/null \
+      && m "### /data/dltrace.so hazir (arkprobe icin) ###"
+  fi
+  # DIKKAT (2026-10-18): izlenen suren hersey /data/dltrace.log'a
+  # yaziyor. Dosyayi HER TURDE temizliyoruz ki yalnizca son
+  # calistirmayi gormek icin gereksiz log birikmesin.
+  if [ -f /bb/dltrace.so ] && [ -f /data/dltrace.so ]; then
+    /bb/cp /bb/dltrace.so /data/dltrace.so 2>/bb/nb/null
+  fi
+  [ -d /data/dalvik-cache/arm64 ] && [ -d /data/tombstones ] \
+    && [ "${dd_ok:-0}" = "1" ] && return 0
+  mountpoint -q /data 2>/bb/nb/null || return 0
+  for d in $DATA_DIRS; do mkdir -p "/data/$d" 2>/bb/nb/null; done
+  if [ -d /data/dalvik-cache/arm64 ]; then
+    if [ "${dd_ok:-0}" != "1" ]; then
+      dd_ok=1
+      m "### /data dizinleri kuruldu (${n:-0}. tur) ###"
+    fi
+  else
+    dd_ok=0
+  fi
+}
+# DIKKAT: zygote'yi elle baslatmak yerine init'e ctl.start ile
+# yolluyoruz; boylece SELinux baglami (u:r:zygote:s0) dogru oluyor.
+# Elle calistirilip cikti yakalandiginda AVC'ler su sekildeydi:
+#     denied { execute } name="app_process64" tcontext=u:object_r:zygote_exec:s0
+# yani baglam dogru, sorun yalnizca /data idi.
+ensure_zygote() {
+  ensure_data_dirs
+  [ "${dd_ok:-0}" = "1" ] || return 0
+  # on koşul: linker'in APEX yollari [system] bolumunde olmali
+  [ "${ld_ok:-0}" = "1" ] || return 0
+  # DIKKAT (HATA DUZELTMESI 2026-10-16): eskiden "bir kez dene" bayragi
+  # vardi (zyg_tried). Tek deneme basarisiz olunca bir daha ASLA
+  # denenmiyordu ve zygote hic kalkmiyordu:
+  #     pid=14386 state=Z ppid=1 threads=1
+  #     pid=14393 state=Z ppid=1 threads=1
+  #     logcat'te zygote izi YOK
+  # init.svc.zygote ise "running" gorunuyordu -- init olmus
+  # sureci temizlememis, bayrak bayat kalmisti.
+  #
+  # DIKKAT: "running" OZELLIGI YETERLI DEGIL. Gercek yasamayi
+  # olcuyoruz: HICBIR zygote64 surucu ZOMBI olmamali. kill -0
+  # gibi yontemlar bu tuzagi verir; ps ciktisindaki koseli
+  # parantez ve /proc/<pid>/stat 3. alani (Z) ayirt edicidir.
+  zstate="yok"
+  for p in $(/bb/ps -A 2>/bb/nb/null | /bb/grep zygote64 | /bb/tr -s ' ' | /bb/cut -d' ' -f1); do
+    st=$(/bb/cut -d' ' -f3 "/proc/$p/stat" 2>/bb/nb/null)
+    [ "$st" = "Z" ] && continue
+    zstate="yasaniyor(pid=$p,st=$st)"
+    break
+  done
+  case "$zstate" in
+    yasaniyor*) return 0 ;;
+  esac
+  # Deneme araligi: her 20 turda bir (yaklasik 20 saniye).
+  ztries=$(( ${ztries:-0} + 1 ))
+  [ $((ztries % 20)) -ne 1 ] && return 0
+  # DIKKAT: init.svc.zygote "running" gorunuyor ama canli surec
+  # yoksa init ctl.start i ISLEMEZ ("servis zaten calisiyor").
+  # Bu durumda once durduruyoruz:
+  #     pid=14386 state=Z ppid=1   <- zombi, init onu reaper olarak
+  #                                     tutuyor, bayrak bayat "running"
+  svc=$(/system/bin/getprop init.svc.zygote 2>/bb/nb/null)
+  case "$svc" in
+    running)
+      /system/bin/setprop ctl.stop zygote 2>/bb/nb/null
+      sleep 2
+      ;;
+  esac
+  /system/bin/setprop ctl.start zygote 2>/bb/nb/null
+  sleep 8
+  m "### ctl.start zygote #$ztries -> svc=$(/system/bin/getprop init.svc.zygote 2>/bb/nb/null) dcache=$([ -d /data/dalvik-cache/arm64 ] && echo VAR || echo YOK) ###"
+  sleep 5
+  m "### zygote durumu: $zstate | app_process=$(/bb/ps -A 2>/bb/nb/null | /bb/grep -c app_process) adet ###"
+  return 0
+}
+
+ensure_adbd() {
+  # DIKKAT (2026-10-16): adbd TEK BIR kez elle denenir ve stderr'i
+  # kmsg'ye basilir. init in adbd'si hicbir cikti yazmadan status 1
+  # ile oluyordu; elimizde HICBIR ipucu yoktu:
+  #     init: Service 'adbd' (pid 6248) exited with status 1
+  # Bu bir teşhis yolu; init in adbd'sini DURDURMAZ, sadece ikinci
+  # bir kopya dener (5555 zaten tutuldugu icin baglanamaz ama
+  # baslama loglari basilir).
+  #
+  # DIKKAT: bayrak adi 'adbd_once' -- 'adbd_diag' DEGIL. Diger bir
+  # fonksiyon (satir 1043) ayni adi kullaniyor ve ensure_adbd'den
+  # ONCE calisip bayragi 1 yapiyordu; bizim blogumuz hic girmedi:
+  #     ### ADBD-DIAG ... (logda hic gorunmedi)
+  if [ "${adbd_once:-0}" != "1" ]; then
+    adbd_once=1
+    mkdir -p /bb/nb 2>/bb/nb/null
+    LD_LIBRARY_PATH=/apex/com.android.adbd/lib64 HOME=/tmp TMPDIR=/tmp \
+      /apex/com.android.adbd/bin/adbd tcp:5555 \
+        > /bb/nb/adbd-diag.out 2> /bb/nb/adbd-diag.err &
+    sleep 6
+    m "### ADBD-DIAG out: $(/bb/cat /bb/nb/adbd-diag.out 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 400)"
+    m "### ADBD-DIAG err: $(/bb/cat /bb/nb/adbd-diag.err 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 900)"
+  fi
+  # DIKKAT (2026-10-15): adbd'yi INIT baslatmali, elle degil. Sebep:
+  # APEX'in kendi init.rc'si soyle diyor
+  #     service adbd /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0
+  #         socket adbd seqpacket 660 system system
+  #         seclabel u:r:adbd:s0
+  # 'socket' satiri: init bir SEQPACKET unix socketu acar ve surece
+  # ANDROID_SOCKET_adbd=fd verir. Elle baslatinca o fd YOK:
+  #     adbd E auth.cpp:203] Failed to get adbd socket: Operation not permitted
+  # ve adbd 5555'i DINLEMEZ (tcp5555=0) -- surec yasayip sessizce
+  # ise yaramaz bir durumda kalir.
+  #
+  # DIKKAT (ZAMANLAMA, 2026-10-15): 'class core' servisleri
+  # class_start core aninda baslatir; bu supervisor'un 20. turundan
+  # ONCE olur. Bizim /apex/com.android.adbd/etc/ld.config.txt bind
+  # mount'umuz ancak ensure_adbd (n>=20) icinde kuruluyor -- yani
+  # init'in baslattigi adbd linker hatasina dustugu icin surec
+  # olup olup duruyor (svc=restarting).
+  # COZUM: ld.config.txt'i daha erken kur. ensure_net'in yanina
+  # (n>=15) cagiriyoruz.
+  case "$(/system/bin/getprop init.svc.adbd 2>/bb/nb/null)" in
+    running)
+      adbd_ok=1
+      adbd_pid=$(find_adbd)
+      return 0 ;;
+  esac
+  # DIKKAT (2026-10-16, KRITIK DÜZELTME): Olcut artık SUREC DEGIL,
+  # DİNLEYİCİ. 'svc=restarting' durumunda adbd sureci aslinda yasiyor
+  # (nabiz iki kez ayni pid'i gosteriyor: "svc=restarting pid=2670")
+  # ama 5555'i DINLEMIYOR. Onceki surumde yasayan pid gorulunce
+  # sayac sifirlaniyor ve 40'a hic ulasilamadigi icin AUTOPSY
+  # CALISAMIYORDU (AUTOPSY sayisi: 0 olculdu).
+  # Dogru olcut: /proc/net/tcp'te 5555 (0x15B3) var mi?
+  #   yok -> adbd ise yaramaz, elle baslatip AUTOPSY'yi dene
+  #   var -> L5'e giden yol acik, bir sey yapma
+  # DIKKAT (OLCUM ARACI DOGRULANDI, 2026-10-16): once '/proc/net/tcp
+# icinde :15B3 var mi' diye bakıyorduk ve hep 0 cikti. Test
+# gosterdi ki BU TABLO BU NAMESPACE'DE HIC BOS DEGIL, TAMAMEN BOS:
+#     nc -l -p 5599  ->  netstat: tcp 0.0.0.0:5599 LISTEN
+#                       /proc/net/tcp: 0 satir
+# Yani /proc/net/tcp bize gosterilmiyor (init kendi /proc mount'unu
+# yapiyor, supervisor eski mount'u goruyor). DOGRULENMIS olcut bu
+# yuzden netstat'a gecildi.
+if /bb/netstat -ltn 2>/bb/nb/null | /bb/grep -q ':5555'; then
+    adbd_ok=1
+    adbd_pid=$(find_adbd)
+    return 0
+  fi
+  ctl_tries=$(( ${ctl_tries:-0} + 1 ))
+  # DIKKAT (2026-10-16, OLÇUM DÜZELTMESİ): 'netstat -ltn | grep :5555'
+  # yerine once KARSILASTIRMALI (probe) sonra AUTOPSY. Sebep:
+  # dışarıdan bağlantı denemesi "TCP KURULDU + RST" veriyor --
+  # bu, iki olasılıktan biri:
+  #   (a) adbd dinliyor ve baglantıyı reddediyor
+  #   (b) adbd hiç dinlemiyor, SLIRP guest'in RST'ini bize yansıtıyor
+  # netstat -an/-ltn6 (düz ve IPv6) ikisini de ayirt ediyor.
+  if [ $((ctl_tries % 4)) -eq 1 ]; then
+    /system/bin/setprop ctl.start adbd 2>/bb/nb/null
+    /bb/sleep 1
+    m "### ctl.start adbd #$ctl_tries -> svc=$(/system/bin/getprop init.svc.adbd 2>/bb/nb/null) L4=$(/bb/netstat -an 2>/bb/nb/null | /bb/grep -c 5555) L6=$(/bb/netstat -ltn6 2>/bb/nb/null | /bb/grep -c 5555)"
+  fi
+  # DIKKAT (2026-10-16, GERI ALMA): AUTOPSY artik KAPALI.
+  # O bir teshis aracidir: init in adbd servisini ctl.stop ile
+  # DURDURUP adbd'yi elle baslatiyordu. Elle baslatilan adbd
+  # TCP dinleyicisini ACMIYOR (init in socket aktivasyonu ve
+  # u:r:adbd:s0 baglami gerekiyor), yani bizim elimizi baglamistik:
+  #   ### adbd=ayakta svc=stopped pid=6464 tcp5555=0
+  #   adb connect -> device not found
+  # L5 artik init in adbd'si ile calisiyor; AUTOPSY sadece L5 i
+  # bozuyor. Fonksiyon kodda duruyor (yeniden gerekirse).
+  if [ "${AUTOPSY:-0}" = "1" ] && [ "$ctl_tries" -ge 12 ]; then
+    adbd_autopsy
+    return 0
+  fi
+  # DIKKAT (2026-10-16, AUTOPSY KAPALI): ayirt edici probu net oldu:
+  #     5900 (bos port) -> Connection refused  (QEMU guest'e ULASIR)
+  #     5555            -> TCP KURULDU, sonra RST
+  # Yani adbd 5555'te DINLIYOR ve baglantiyi KABUL ediyor, hemen
+  # kapatiyor. Sebebi auth: ANDROID_SOCKET_adbd fd'si olmadigi icin
+  #     adbd E auth.cpp:203] Failed to get adbd socket: Operation not permitted
+  # ve baglanti reddediliyor. Elle baslatilan adbd bu fd'yi HICBIR
+  # zaman alamaz -- yalnizca init verebilir.
+  # Cozum: gereken property'ler hazirlandi, simdi sadece init'in
+  # baslattigi adbd kullaniliyor:
+  #   ro.adb.secure=0                          (build.prop yamasi)
+  #   persist.adb.tls_server.enable=0          (init.environ.rc, early-init)
+  #   setenv LD_LIBRARY_PATH .../lib64         (init.environ.rc service adbd)
+  #   /apex/com.android.adbd/etc/ld.config.txt (mountapex, init'ten once)
+  # Onceki denemelerde bu dortu de EKSIKTI; simdi tamam.
+  # AUTOPSY (adbd_autopsy) teşhis araci olarak yazili kalir ama
+  # ÇAĞRILMAZ: elle baslatilan adbd calistigi halde reddediyor.
+  return 0
+  [ -x /apex/com.android.adbd/bin/adbd ] || return 0
+  # DIKKAT (HATA 2026-10-15): gunluk /bb/adbd.log idi. init 'on post-fs'
+  # kok dosya sistemini salt okunur yaptigi icin o andan sonra OLUSTURULAMIYOR
+  # ve ensure_adbd her denemede daha adbd'yi calistirmadan cokuyordu:
+  #     can't create /bb/adbd.log: Read-only file system
+  # Yani o denemeler linker hatasi DEGIL, bizim dosya hatamizdi.
+  # Cozum: gunlugu /bb/nb altina yaz; /bb/nb uzerinde kalici tmpfs var.
+  LOGF=/bb/nb/adbd.log
+  adbd_ldconfig
+  # ---------------------------------------------------------------------
+  # BELIRLEYICI DENEY (2026-10-15).
+  #
+  # Olcutulen durum:
+  #   - /apex/com.android.adbd/lib64/libadb_protos.so DOSYA OLARAK VAR
+  #   - /linkerconfig/ld.config.txt icinde /apex/com.android.adbd/lib64 YOLU VAR
+  #   - bizim yazdigimiz config dogru ve LD_CONFIG_FILE ile veriliyor
+  #   - ama linker yine "libadb_protos.so not found" diyor ve BILDIRMIYOR
+  #     ki o an config'i okuyup okumadi (hicbir parser hatasi basilmadi).
+  #
+  # Ayirt edici olcut: adbd'nin NEEDED sirasi sirasiyla
+  #   libadbd_fs liblog libselinux libbase libadb_protos libadbd_auth ...
+  # Bu SIRANIN ilk dortu /system/lib64'te VAR, libadb_protos.so SADECE
+  # /apex/com.android.adbd/lib64'te var. Linker sirayla cozuyor ve ilk
+  # bulamadigini yaziyor. Demek /system/lib64 arama yolunda, ama
+  # /apex/com.android.adbd/lib64 DEGIL.
+  #
+  # Yani elimizde su an iki hipotez var ve TEK ACILISTA ayirt edilebilir:
+  #   H1: linker config'i hic kullanmiyor  -> LD_LIBRARY_PATH ise yarar
+  #   H2: linker config'i kullaniyor ama APEX yolu eleniyor
+  #       -> config'in KENDISINI (globali) apex/etc altina kopyalamak ise yarar
+  # Asagidaki 5 varyant sirayla denenir; ilk ayakta kalan kazanir.
+  # ---------------------------------------------------------------------
+  if [ -n "${adbd_win:-}" ]; then
+    try_adbd "$adbd_win" "$adbd_we1" "$adbd_we2" "$adbd_wf"
+    res=$(/bb/cat /bb/nb/adbd.res 2>/bb/nb/null)
+    adbd_pid=""
+    case "$res" in "ok "*) adbd_pid=${res#ok }; adbd_ok=1 ;; *) adbd_ok=0 ;; esac
+    return 0
+  fi
+  for v in ldpathP ldpath apexcfg plain ldcfg both apexcfg2; do
+    f4=""
+    case "$v" in
+      ldpath)  e1="LD_LIBRARY_PATH=/apex/com.android.adbd/lib64"; e2="" ;;
+      ldpathP) e1="LD_LIBRARY_PATH=/apex/com.android.adbd/lib64"; e2=""; f4="-P" ;;
+      apexcfg)
+              /bb/cp /linkerconfig/ld.config.txt \
+                     /apex/com.android.adbd/etc/ld.config.txt 2>/bb/nb/null
+              m "### VARYANT apexcfg: global config apex/etc altina kopyalandi ($(wc -c < /apex/com.android.adbd/etc/ld.config.txt 2>/bb/nb/null) bayt)"
+              e1=""; e2="" ;;
+      apexcfg2)
+              /bb/cp /linkerconfig/ld.config.txt \
+                     /apex/com.android.adbd/etc/ld.config.txt 2>/bb/nb/null
+              /bb/cp /linkerconfig/ld.config.txt \
+                     /bb/nb/adbdld/ld.config.txt 2>/bb/nb/null
+              e1="LD_CONFIG_FILE=/bb/nb/adbdld/ld.config.txt"; e2="" ;;
+      plain)  e1=""; e2="" ;;
+      ldcfg)  e1="LD_CONFIG_FILE=/bb/nb/adbdld/ld.config.txt"; e2="" ;;
+      both)   e1="LD_LIBRARY_PATH=/apex/com.android.adbd/lib64"
+              e2="LD_CONFIG_FILE=/bb/nb/adbdld/ld.config.txt" ;;
+    esac
+    adbd_flag="$f4"
+    try_adbd "$v" "$e1" "$e2" "$f4"
+    res=$(/bb/cat /bb/nb/adbd.res 2>/bb/nb/null)
+    adbd_pid=""
+    case "$res" in
+      "ok "*)
+        adbd_pid=${res#ok }
+        adbd_win="$v"; adbd_we1="$e1"; adbd_we2="$e2"; adbd_wf="$f4"; adbd_ok=1
+        m "### adbd AYAKTA (pid $adbd_pid, varyant=$v) tcp:5555 -> adb connect 127.0.0.1:5555"
+        m "###   $(/bb/head -c 300 "$LOGF" 2>/bb/nb/null | /bb/tr '\n' ' ')"
+        return 0 ;;
+      *)
+        adbd_ok=0
+        m "### VARYANT $v TAM LOG: $(/bb/cat /bb/nb/adbd.log 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 700)" ;;
+    esac
+  done
+  return 0
+}
+
+# Bir adbd denemesi yapar. Sonucu /bb/nb/adbd.res dosyasina yazar:
+#   "ok <pid>"  -> adbd ayakta
+#   "fail"      -> olmedi
+# DIKKAT: sonucu stdout'a DEGIL dosyaya yaziyoruz. Supervisor'un stdout'u
+# /dev/kmsg; m() fonksiyonu da oraya yaziyor, yani $() ile alirsak adbd_pid
+# kutusu log satirlariyla kirlenir.
+# DIKKAT: alt kabuk kullaniliyor cunku exec ile degistirilirse $& job pid
+# degil, alt kabugun pid'si olur; bu yuzden $$ pid dosyasina once yazilir.
+# Calisan gercek adbd surecini bul. DIKKAT: adbd kendini arka plana
+# cikarir (fork + parent cikar), yani $& ile aldigimiz pid COCUK kabuk
+# olup cokebilir. Asil adbd sureci /proc taramasiyla bulunur.
+# Bunu yapmadigimizda "AYAKTA" dedigimiz sey 5 saniye sonra olmus bir
+# zombie idi -- nabiz listesinde hic gorunmedi.
+find_adbd() {
+  for pd in /proc/[0-9]*; do
+    [ "$(/bb/cat "$pd/comm" 2>/bb/nb/null)" = "adbd" ] || continue
+    /bb/echo "${pd#/proc/}"
+    return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------
+# adbd OLUM TEŞHİSİ (2026-10-15)
+#
+# Durum: init adbd'yi dogru tanimla baslatiyor --
+#     init: starting service 'adbd'...
+#     init: Created socket '/dev/socket/adbd', mode 660, user 1000, group 1000
+# -- ama svc=restarting: surec cokup init yeniden baslatiyor ve
+# /proc/net/tcp'te 5555 hic gorunmuyor.
+#
+# Gozlemimiz TEK: init.svc.adbd=restarting. Adbd'nin NEDEN oldugu
+# gorunmuyor cunku:
+#   (a) adbd hatasi logd'ye yaziyor; bizim logcat -d cagrimiz BOS
+#       donuyor ("### logcat/adb:" bos) -> logd tamponu bize acik degil
+#   (b) init'in stdout/stderr yonlendirmesi (/bb/nb/adbd-init.log)
+#       HIC YAZILMIYOR -> bu init surumu stdout/stderr komutunu
+#       desteklemiyor olabilir ya da dosya acilamiyor
+#
+# Bu yuzden bagimsiz bir yol kuruyoruz: adbd'yi supervisor'in
+# KENDI surecimiz icinde, kontrol sifresiz, stdout/stderr dosyaya
+# yonlendirilmis olarak calistirip 10 sn sonra hayatta olup olmadigini
+# ve dosyada ne yazdigini olceriz. Init'in baslattigi adbd'yi once
+# durduruyoruz ki iki adbd cakismasin.
+adbd_autopsy() {
+  [ "${autopsy:-0}" = "1" ] && return 0
+  autopsy=1
+  # init'in baslattigi adbd'yi durdur: ayni anda iki adbd, ayni
+  # 5555 portu -> biri digerini reddeder ve olcum bulaniklasir.
+  # DIKKAT: ctl.stop YETERLI DEGIL -- init servisi "disabled" olmadigi
+  # icin (biz kaldirdik) hemen yeniden baslatir ve yeni surec
+  # otomatik olarak 5555'i kapar. Bu yuzden iki yontem de deneniyor:
+  # once ctl.stop, sonra pid'i dogrudan kill.
+  /system/bin/setprop ctl.stop adbd 2>/bb/nb/null
+  /bb/sleep 2
+  for k in 1 2 3; do
+    kp=$(find_adbd)
+    [ -z "$kp" ] && break
+    kill -9 "$kp" 2>/bb/nb/null
+    /bb/sleep 1
+  done
+  m "### AUTOPSY basliyor (init'in adbd'si durduruldu, kalan=$(find_adbd))"
+  # DIKKAT: elle baslatinca da bu ozellik gerekli. AUTOPSY'nin
+  # bulgusu: adbd TCP oncesi 'persist.adb.tls_server.enable=1'
+  # bekliyor ve ozellik tanimsiz oldugu icin asili kalip 5555'i
+  # acmiyor. setprop init'in property service'ine yaziyor.
+  /system/bin/setprop persist.adb.tls_server.enable 0 2>/bb/nb/null
+  m "### AUTOPSY tls_server=$(/system/bin/getprop persist.adb.tls_server.enable 2>/bb/nb/null)"
+  LD_LIBRARY_PATH=/apex/com.android.adbd/lib64 \
+  /apex/com.android.adbd/bin/adbd tcp:5555 \
+    > /bb/nb/autopsy.out 2> /bb/nb/autopsy.err &
+  apid=$!
+  /bb/sleep 10
+  if kill -0 "$apid" 2>/bb/nb/null; then
+    m "### AUTOPSY: adbd 10 sn sonra AYAKTA (pid $apid)"
+  else
+    st=$(/bb/awk '{print $3}' "/proc/$apid/stat" 2>/bb/nb/null)
+    m "### AUTOPSY: adbd OLDU (durum=${st:-yok}, pid $apid)"
+  fi
+  m "### AUTOPSY stdout: $(/bb/cat /bb/nb/autopsy.out 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 500)"
+  # DIKKAT: 500 bayt yetersiz kaldi -- 'main.cpp:182] Setup mdns on
+  # port= 5555' satiri bu esigin hemen sonunda geliyor ve kesiliyordu.
+  m "### AUTOPSY stderr: $(/bb/cat /bb/nb/autopsy.err 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 1400)"
+  m "### AUTOPSY tcp5555: L4=$(/bb/netstat -an 2>/bb/nb/null | /bb/grep -c 5555) L6=$(/bb/netstat -ltn6 2>/bb/nb/null | /bb/grep -c 5555)"
+  m "### AUTOPSY netstat4: $(/bb/netstat -an 2>/bb/nb/null | /bb/tr '\n' '|')"
+  m "### AUTOPSY netstat6: $(/bb/netstat -ltn6 2>/bb/nb/null | /bb/tr '\n' '|')"
+  # -------------------------------------------------------------------
+  # KESIF (2026-10-16): Adbd 'main.cpp:186] adbd listening on
+  # tcp:5555' ve 'main.cpp:287] adbd started' DIYOR, mDNS kaydi bile
+  # basarili ('mdns.cpp:109] registered: 1') -- ama netstat -an
+  # icinde HICBIR TCP SOCKET YOK. Tek dinleyici UNIX socket
+  # (/dev/socket/property_service).
+  # Iki hipotez:
+  #   H1) adbd KENDI NETWORK NAMESPACE'INE girdi (unshare). QEMU'nun
+  #       hostfwd'i ana namespace'teki 10.0.2.15'e gider, adbd'yi
+  #       GOREMEZ. '5900 refused / 5555 RST' tam da bunun gorunumu.
+  #   H2) adbd socket'i acmadi, log yalan soyluyor.
+  # AYIRT EDICI: /proc/<pid>/net/tcp O SURECIN KENDI namespace'ini
+  # gosterir + /proc/<pid>/ns/net inode'i.
+  # -------------------------------------------------------------------
+  ap=$(find_adbd)
+  if [ -n "$ap" ]; then
+    m "### NS: adbd=$ap self=$(/bb/readlink /proc/self/ns/net 2>/bb/nb/null) adbd_ns=$(/bb/readlink "/proc/$ap/ns/net" 2>/bb/nb/null)"
+    m "### NS-adbd-tcp: $(/bb/cat "/proc/$ap/net/tcp" 2>/bb/nb/null | /bb/head -3 | /bb/tr '\n' '|')"
+    m "### NS-self-tcp: $(/bb/cat /proc/self/net/tcp 2>/bb/nb/null | /bb/head -3 | /bb/tr '\n' '|')"
+    # ---------------------------------------------------------
+    # KESIF (2026-10-16): 'netstat' ile '/proc/net/tcp' BIRBIRINI
+    # DOGRULAMIYOR ve bu ihtilafi cozmek icin 1-2 KAYIT birbiriyle
+    # karsilastiriliyor:
+    #   (1) nc -l 5599 acar -> netstat LISTEN gosteriyor, ama
+    #       /proc/net/tcp 0 satir. Yani /proc/net/tcp bu namespace'te
+    #       BOZUK gorunuyor; netstat guvenilir.
+    #   (2) adbd'nin ACIK FD listesi (/proc/<pid>/fd) -> socket girdisi
+    #       varsa socket GERCEKTEN aciktir.
+    # Bu ucuncu olcum belirleyici.
+    # ---------------------------------------------------------
+    fds=""
+    for f in /proc/$ap/fd/*; do
+      t=$(/bb/readlink "$f" 2>/bb/nb/null)
+      case "$t" in
+        socket:*) fds="$fds $t" ;;
+      esac
+    done
+    m "### FD-adbd-socket: $(/bb/echo ${fds:-YOK} | /bb/head -c 200)"
+    nfd=$(/bb/ls /proc/$ap/fd 2>/bb/nb/null | /bb/wc -l)
+    m "### FD-adbd-toplam: $nfd  ls=$(/bb/ls -l /proc/$ap/fd 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 400)"
+  fi
+  m "### AUTOPSY socket: $(/bb/ls -l /dev/socket/ 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 300)"
+  # DIKKAT: adbd 'listening on tcp:5555' demis olabilir ama
+  # /proc/net/tcp'te 5555 gorunmuyor. Iki olasilik:
+  #   (a) adbd IPv6 dinleyicisini acti (/proc/net/tcp6)
+  #   (b) bind basarisiz olup adbd bunu sadece logluyor
+  # Ayirt etmek icin TCP tablosunun tamamini doktoruz.
+  m "### AUTOPSY tcp-tablosu: $(/bb/cat /proc/net/tcp 2>/bb/nb/null | /bb/head -4 | /bb/tr '\n' '|')"
+  m "### AUTOPSY tcp6-tablosu: $(/bb/cat /proc/net/tcp6 2>/bb/nb/null | /bb/head -4 | /bb/tr '\n' '|')"
+  # DIKKAT (OLCUM ARACI DOGRULAMASI): 'tcp5555: 0' ve tamamen bos
+  # tcp tablosu, adbd'nin gercekten bind OLMADIGI yorumuna
+  # yol aciyor -- ama ya tablo bizim mount namespace'imizde
+  # gorunmuyorsa? (/init kendi /proc'sini mount ediyor.)
+  # KONTROL: supervisor'in KENDI busybox'ile bir port ac. Gorunurse
+  # tablo saglamdir ve adbd gercekten dinlemiyor demektir.
+  /bb/nc -l -p 5599 > /bb/nb/null 2>&1 &
+  ncpid=$!
+  /bb/sleep 1
+  m "### OLCUM TESTI: nc -l 5599 pid=$ncpid durum=$(/bb/awk '{print $3}' /proc/$ncpid/stat 2>/bb/nb/null) tcp4-satir=$(/bb/grep -c ':15C7' /proc/net/tcp 2>/bb/nb/null) netstat=$(/bb/netstat -ltn 2>/bb/nb/null | /bb/tr '\n' '|')"
+  kill -9 "$ncpid" 2>/bb/nb/null
+  # Adbd gercekten ayakta kaldiysa BIRAKMA: L5'e giden yol budur.
+  if kill -0 "$apid" 2>/bb/nb/null; then
+    adbd_pid=$apid
+    adbd_ok=1
+    adbd_win=autopsy
+    m "### AUTOPSY BASARILI: adbd bizim surecimiz, elle baslatildi"
+  else
+    m "### AUTOPSY BASARISIZ: elle baslatma da olmuyor"
+  fi
+  return 0
+}
+
+try_adbd() {
+  (
+    [ -n "$2" ] && export "$2"
+    [ -n "$3" ] && export "$3"
+    echo $$ > /bb/nb/adbd.pid
+    # DIKKAT: '-a' = adbd arka planda kendini cogaltmaz (nodaemon) ve
+    # TUM loglarini stdout'a yazar. Varsayilan modda adbd kendi
+    # gorunmez cocugunu acar ve baglanti basina olaylari /dev/kmsg
+    # UZERINE yazmiyor -- logda hicbir iz yoktu, elimizde tek bilgi
+    # "offline" idi. -a ile her baglanti denemesi adbd.log'a duser.
+    exec /apex/com.android.adbd/bin/adbd $4 tcp:5555
+  ) > /bb/nb/adbd.log 2>&1 &
+  /bb/sleep 5
+  # DIKKAT: basari olcutu "kabuk pid'i yasiyor" DEGIL, /proc'da comm=adbd
+  # olan GERCEK bir surec var mi. Adbd arka plana cikiyor; $& pid'i
+  # (alt kabuk) cokebiliyor ve kill -0 zombie'a da basarili donuyordu.
+  rp=$(find_adbd)
+  if [ -n "$rp" ]; then
+    /bb/echo "ok $rp" > /bb/nb/adbd.res
+    return 0
+  fi
+  /bb/echo "fail" > /bb/nb/adbd.res
+  m "### VARYANT $1 basarisiz (adbd sureci yok) : $(/bb/head -c 300 /bb/nb/adbd.log 2>/bb/nb/null | /bb/tr '\n' ' ')"
+  return 1
+}
+adbd_pid=""
+adbd_ok=0
+
+# --- /init gunlugunu kmsg'e BOSALT -----------------------------------------
+# DIKKAT (2026-10-15): /init artik dogrudan kmsg'e yazmiyor, /bb/init.out
+# dosyasina yaziyor. Sebep: kmsg cikislari printk limitine takiliyor ve
+# /init'in butun ciktisi kayboluyordu:
+#     printk: init: 40 output lines suppressed due to ratelimiting
+# Limit 5 sn / 10 satir. Bizim surec adimiz "init" oldugu icin (betigin
+# adi /init) baskilan cagri noktasi bize yaziliyor.
+#
+# Burada her saniye en fazla 3 satiri aktariyoruz: 3/saniye = 15/5sn,
+# tam sinirin ALTINDA (10/5sn) kalmiyor... aslinda tam sinirda; bu
+# yuzden 2/saniye (10/5sn) kullaniliyor ve kalan bir sonraki turda.
+drain_init() {
+  D=/bb/init.out
+  [ -f "$D" ] || return 0
+  tot=$(/bb/wc -l < "$D" 2>/bb/nb/null)
+  tot=${tot:-0}
+  [ "$tot" -gt "${idone:-0}" ] 2>/bb/nb/null || return 0
+  sed -n "$((idone + 1)),$((idone + 4))p" "$D" 2>/bb/nb/null | while read -r l; do
+    [ -n "$l" ] || continue
+    /bb/echo "$l"
+  done
+  idone=$tot
+  return 0
+}
+idone=0
+
+ensure_apex() {
+  # DIKKAT (GERI ALMA 2026-10-16): /apex/apex-info-list.xml'i
+  # supervisor dongusunde yeniden uretmeyi denedim ve sistemi
+  # BOZDUM. Sebep zor bir denklem:
+  #
+  #   apex-info-list.xml YOKSA -> linkerconfig ANINDA abort ediyor
+  #       I/O warning: failed to load external entity
+  #       init in "exec -- linkerconfig" komutu HIZLA donuyor,
+  #       early-init biter, class core baslar. (BU IYI HAL)
+  #
+  #   apex-info-list.xml VARSA  -> linkerconfig CALISIYOR ve tam
+  #       config uretiyor (300 satir). Ama init bunu "exec" ile
+  #       cagirdigi icin early-initi BLOKE ediyor; TCG emulasyonunda
+  #       bu dakikalarca suruyor. Sonuc:
+  #       init: starting service ueventd... -> status 1
+  #       (hicbir sey baslamiyor, adbd bile calismiyor)
+  #
+  # Ayrica linkerconfig'un urettigi config APEX kutuphane
+  # yollarini zaten ICERMIYOR (olculdu: grep -c apex -> sadece 4,
+  # sadece com.android.runtime). Yani bizim fix_ldconfig zaten
+  # asil kaynak; bu dosyadan hicbir fayda gelmiyor.
+  #
+  # KARAR: dosyayi uretmeyelim. Dosyanin YOKLUZU burada bir
+  # ozellik, bir hata degil.
+  true
+  # Her APEX icin: mount noktasi degilse bagla.
+  # DIKKAT: "Device or resource busy" burada NORMALDIR. Supervisor her saniye
+  # calisiyor; zaten mount'lu olan bir APEX'i yeniden mount etmeye calisirsa
+  # iste bu hatayi verir. Bu yuzden once mountpoint'e bakip karar veriyoruz.
+  added=0; busy=0
+  for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+    # DIKKAT (HATA 2026-10-15): burada dongu degiskeni 'n' idi ve
+    # DENETLEYICININ DONGU SAYACINI EZIYORDU:
+    #     n=${entry%%:*}
+    # supervisor govdesindeki 'n' dongu sayaci. ensure_apex her cagrildiginda
+    # 'n' APEX bolum numarasina donusuyor ve BIR DAHA ARTMIYORDU:
+    #     [  4.01] ### iter=0
+    #     [  5.84] ### iter=27
+    #     [  9.54] ### iter=27
+    #     ... 361 kez hep 27
+    # Sonuc: n'e bagli TUM tetikleyiciler sessizce hic calismadi --
+    #     n >= 45   -> ensure_adbd (L5'in anahtari)   HIC BASLAMADI
+    #     n == 25   -> /bb/diag2                       hic
+    #     n == 40   -> ueventd elle calistirma          hic
+    #     n % 15    -> nabiz satirlari                   hic
+    # Olcum (nabiz satiri) eklemek bu hatayi ANLADI; o olmasa
+    # denetleyici "calisiyor" sanilirdi.
+    # COZUM: ayri isim. Sayac 'n' kaliyor.
+    apn=${entry%%:*}; apname=${entry#*:}
+    mountpoint -q /apex/$apname 2>/bb/nb/null && continue
+    mkdir -p /apex/$apname 2>/bb/nb/null
+    # DIKKAT: /dev/vda* init tarafindan siliniyor; kalici kopyalar /devblk'de.
+    if e=$(mount -t ext4 -o ro /devblk/vda$apn /apex/$apname 2>&1); then
+      added=$((added+1))
+    else
+      busy=$((busy+1))
+      [ -n "$e" ] && m "###   [$apname] /devblk/vda$apn: $e"
+    fi
+  done
+  # linkerconfig VNDK modulunu sabit isimle arar; takma ad olmazsa
+  # "Unable to access VNDK APEX" verip APEX yollarini hic yazmiyor.
+  if ! mountpoint -q /apex/com.android.vndk.v31 2>/bb/nb/null; then
+    mkdir -p /apex/com.android.vndk.v31 2>/bb/nb/null
+    for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+      case "$entry" in
+        *:com.android.vndk.current)
+          mount -t ext4 -o ro /devblk/vda${entry%%:*} /apex/com.android.vndk.v31 2>/bb/nb/null ;;
+      esac
+    done
+  fi
+  if [ $added -gt 0 ] || [ $busy -gt 0 ]; then
+    m "### /apex tazelendi: $added yeni mount, $busy basarisiz ###"
+    m "###   /dev/vda*: $(/bb/ls /dev/vda* 2>&1 | /bb/tr '\n' ' ')"
+    m "###   /apex    : $(/bb/ls /apex 2>&1 | /bb/tr '\n' ' ' | /bb/cut -c1-160)"
+    fix_ldconfig
+  fi
+}
+
+# --- ld.config.txt: APEX arama yollarini yeniden yaz ------------------------
+# DIKKAT BU ADIM ZIGOTE'UN ONUNDEKI SON ENGELDI.
+#
+# Dinamik linker, DT_NEEDED'daki 'libc.so'yu calistirilan programin
+# dizininde DEGIL, ld.config.txt icindeki
+# namespace.default.search.paths icinde arar. Bizim /init LD_LIBRARY_PATH
+# export ediyor ama init kendi sureclerine TEMIZ bir cevre gecirir:
+#     apexd: CANNOT LINK EXECUTABLE "/system/bin/apexd":
+#            library "libc.so" not found: needed by main executable
+#
+# NEDEN 0 APEX YOLU: linkerconfig APEX modul listesini
+# /apex/apex-info-list.xml dosyasindan okuyor. init kendi /apex'inin
+# UZERINE bos bir tmpfs mount edince dosya kayboluyor:
+#     linkerconfig: Failed to scan APEX modules :
+#                   Can't read /apex/apex-info-list.xml
+#     ld.config.txt: 0 APEX yolu
+#
+# DIKKAT (HATA DUZELTMESI): bu fonksiyon YALNIZCA ensure_apex mount yaptiginda
+# cagriliyordu. Denetleyici cogu kosuda 'added=0' gordugu icin HIC CAGRILMIYOR
+# ve ld.config.txt 0 APEX yolunda kaliyordu. Artik supervisor dongusunun
+# govdesinden HER saniye cagriliyor (kendisi idempotent).
+fix_ldconfig() {
+  CFG=/linkerconfig/ld.config.txt
+  [ -d /apex/com.android.runtime ] || return 0
+  # DIKKAT (EVR-L29): her turda konfigurasyonu sifirdan olustur.
+  # init'in linkerconfig'i dosyayi bozabilir, bu yuzden her turda
+  # yeniden yazmak en guvenlidir.
+  mkdir -p /linkerconfig 2>/bb/nb/null
+  /bb/echo "# HARMONY-EMU apex yollari basliyor" > "$CFG"
+  /bb/echo "dir.system = /system/bin/" >> "$CFG"
+  /bb/echo "dir.system = /system/lib64/" >> "$CFG"
+  /bb/echo "dir.vendor = /vendor/bin/" >> "$CFG"
+  /bb/echo "dir.vendor = /vendor/lib64/" >> "$CFG"
+  /bb/echo "" >> "$CFG"
+  /bb/echo "[system]" >> "$CFG"
+  /bb/echo "namespace.default.isolated = false" >> "$CFG"
+  /bb/echo "namespace.default.visible = true" >> "$CFG"
+  /bb/echo "namespace.default.search.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64" >> "$CFG"
+  /bb/echo "namespace.default.permitted.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64" >> "$CFG"
+  for a in /apex/*/; do
+    [ -d "$a/lib64" ] || continue
+    lname=${a#/apex/}; case "$lname" in */) lname=${lname%/} ;; esac
+    /bb/echo "namespace.default.search.paths += /apex/$lname/lib64" >> "$CFG"
+    /bb/echo "namespace.default.permitted.paths += /apex/$lname/lib64" >> "$CFG"
+    if [ -d "$a/lib64/bionic" ]; then
+      /bb/echo "namespace.default.search.paths += /apex/$lname/lib64/bionic" >> "$CFG"
+      /bb/echo "namespace.default.permitted.paths += /apex/$lname/lib64/bionic" >> "$CFG"
+    fi
+  done
+  m "### ld.config.txt sifirdan olusturuldu ###"
+  ld_ok=1
+}
+
+pin_selinux() {
+  E=/sys/fs/selinux/enforce
+  [ -e "$E" ] || return 0
+  # DIKKAT (HATA 2026-10-15): burada once bind-mount vardi:
+  #     mount -o bind /bb/enforce0 /sys/fs/selinux/enforce
+  # SELinux ENFORCING oldugu an bu mount REDDEDI LIYOR:
+  #     avc: denied { mounton } for comm="mount"
+  #         path="/sys/fs/selinux/enforce" ... permissive=0
+  # yani koruma hic kurulamiyordu. Ve init politikayi yukledikten sonra
+  # enforcement'i geri A C I Y O R D U (25. saniyede olcduk):
+  #     [24.8 s] permissive=1
+  #     [25.2 s] permissive=0
+  # Sonrasi dogrudan ve olculur: vendor_init alt baglami OLDI:
+  #     avc: denied { read } scontext=u:r:vendor_init:s0
+  #         tcontext=u:object_r:default_prop:s0   permissive=0
+  #     init: Subcontext exited with status 1
+  #
+  # NEDEN dogrudan yazmak calisir (bind-mount neden calismaz):
+  # security/selinux/selinuxfs.c -> sel_write_enforce()
+  #     length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
+  #                           SECCLASS_SECURITY, SECURITY__SETENFORCE, NULL);
+  #     if (length) goto out;          // -EACCES -> yazma BASARISIZ
+  #     enforcing_set(new_value);
+  # Yetki kontrolu CAGIRANIN degil "security" alaninin yetkisine bakar.
+  # Politika o alana setenforce verdigi icin yazma ENFORCING modunda da
+  # gecer. mount ise selinuxfs uzerinde "mounton" yetkisi ister; policy
+  # vermiyor.
+  v=$(/bb/cat "$E" 2>/bb/nb/null)
+  [ "$v" = "0" ] && return 0
+  echo -n 0 > "$E" 2>/bb/nb/null
+  v2=$(/bb/cat "$E" 2>/bb/nb/null)
+  if [ "$v" != "$v2" ]; then
+    m "### SELinux enforce $v -> $v2 (0 = permissive)"
+  fi
+  return 0
+}
+
+# --- EVR-L29: Linker config emin olabilmek icin son kez dogrula ----------
+# fix_ldconfig calistiktan sonra, /linkerconfig/ld.config.txt'in
+# APEX yollarini içerdiğinden emin ol. Eger yoksa, sifirdan olustur.
+ensure_ldconfig_final() {
+  CFG=/linkerconfig/ld.config.txt
+  [ -f "$CFG" ] || return 0
+  # APEX yolu var mi kontrol et
+  if ! /bb/grep -q '/apex/' "$CFG" 2>/bb/nb/null; then
+    m "### ld.config.txt'de APEX yolu yok; sifirdan uretiliyor ###"
+    mkdir -p /linkerconfig 2>/bb/nb/null
+    /bb/echo "# HARMONY-EMU final config" > "$CFG"
+    /bb/echo "dir.system = /system/bin/" >> "$CFG"
+    /bb/echo "dir.system = /system/lib64/" >> "$CFG"
+    /bb/echo "dir.vendor = /vendor/bin/" >> "$CFG"
+    /bb/echo "dir.vendor = /vendor/lib64/" >> "$CFG"
+    /bb/echo "" >> "$CFG"
+    /bb/echo "[system]" >> "$CFG"
+    /bb/echo "namespace.default.isolated = false" >> "$CFG"
+    /bb/echo "namespace.default.visible = true" >> "$CFG"
+    /bb/echo "namespace.default.search.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64" >> "$CFG"
+    /bb/echo "namespace.default.permitted.paths = /system/bin:/system/lib64:/vendor/bin:/vendor/lib64" >> "$CFG"
+    for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+      apname=${entry##*:}
+      /bb/echo "namespace.default.search.paths += /apex/$apname/lib64" >> "$CFG"
+      /bb/echo "namespace.default.permitted.paths += /apex/$apname/lib64" >> "$CFG"
+      if [ -d "/apex/$apname/lib64/bionic" ]; then
+        /bb/echo "namespace.default.search.paths += /apex/$apname/lib64/bionic" >> "$CFG"
+        /bb/echo "namespace.default.permitted.paths += /apex/$apname/lib64/bionic" >> "$CFG"
+      fi
+    done
+    m "### ld.config.txt son definitif versiyon yazildi ###"
+  fi
+}
+
+
+# --- printk susturmayi kapat ------------------------------------------------
+# DIKKAT: kernel komut satirina 'printk_ratelimit=1000000' yaziyoruz ama
+# init'in mesajlari yine de yutuluyor:
+#     printk: init: 32 output lines suppressed due to ratelimiting
+# ve tam da EN ONEMLI kisim kayboluyor:
+#     on init -> start servicemanager
+    start surfaceflinger
+    start system_server
+    start hwservicemanager
+    start vndservicemanager
+# Bu satirlari gormedigimiz icin "servisler hic baslamiyor" dedik; oysa
+# basliyorlar. Komut satiri parametresi bu cekirdekte (ya da bu
+# surumde) uygulanmiyor. CANLI ayar sysctl uzerinden:
+#     /proc/sys/kernel/printk_ratelimit
+#     /proc/sys/kernel/printk_ratelimit_burst
+# Bunlar var degilse sessizce geciliyor; etkisizlik olcumla anlasilir.
+pin_printk() {
+  for f in /proc/sys/kernel/printk_ratelimit /proc/sys/kernel/printk_ratelimit_burst; do
+    [ -w "$f" ] || continue
+    echo 1000000 > "$f" 2>/bb/nb/null
+  done
+}
+
+ensure_fake_blocks() {
+  # DIKKAT: init, /dev ve /sys altindaki YOLLARI bekliyor:
+  #     init: wait for '/dev/nve0' timed out and took 5012ms
+  #     init: wait for '/dev/block/bootdevice/by-name/secure_storage' timed out
+  #     init: wait for '/sys/devices/platform/balong_mloader/modem_start' took 30002ms
+  # Bu yollar bizde YOK (sadece 5 sistem + 21 APEX partition'imiz var), ama
+  # init rc'leri onlari bekliyor. Her eksik yol icin 5-30 saniye bekleniyor;
+  # mount_all tek basina 80 saniye kaybetti.
+  #
+  # DIKKAT: bu yollar fstab dosyalarindan degil, rc dosyalarindaki 'wait'
+  # komutlarindan geliyor (/vendor/etc/init/init.hisi.rc:8 gibi). Bu yuzden
+  # hem fstab'lari hem de TUM rc dosyalarini taramak gerekiyor.
+  #
+  # Cozum: referans verilen tum /dev/... yollarini dizin olarak ONCEDen
+  # olusturmak. wait_for_file ANINDA basarili olur, mount ise cihaz
+  # bulamadigi icin hizli basarisiz olur. Bekleme yok, sonuc ayni.
+  # DIKKAT: SADECE /dev/block/... ve bir kac Huawei dugumu. Daha genis bir
+  # filtre denendi ve SISTEMI KIRDI: rc dosyalarinda '/dev/null' da gectigi icin
+  # onu dizin olarak olusturduk ve init'in birinci asamasi mknod ile patladi:
+  #     init: mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3)) failed File exists
+  #     init: Init encountered errors starting first stage, aborting
+  # Yani /dev'in standart dugumlerine ASLA dokunmuyoruz.
+  created=0; skipped=0
+  for d in /vendor/etc/init /system/etc/init /odm/etc/init /cust/etc/init \
+           /vendor/etc/init/charger /system/etc/init/hw; do
+    [ -d "$d" ] || continue
+    for p in $(/bb/grep -rhoE '/dev/block/[a-zA-Z0-9_./-]+' "$d" 2>/bb/nb/null | /bb/sort -u); do
+      [ -e "$p" ] && continue
+      # DIKKAT (REGRESYON DUZELTMESI 2026-10-15): 'modem' iceren yollari
+      # OLUSTURMUYORUZ. Onceki kosuda bu dizinler olustugu icin fs_mgr
+      # mount'u denemeye calisti, 'check,formattable' bayraklari yuzunden
+      # format denedi ve /vendor/etc/fstab.modem 80 SANIYE bekletti.
+      # 'on fs' -> 80s, 'on post-fs' -> 30s; toplam 110 saniye, ve init
+      # post-fs'i bitiremedigi icin class main (Zygote) hic baslamadi.
+      # Modem QEMU'da zaten calisamaz; sahte yol olusturmak sadece
+      # zaman kaybiydi.
+      case "$p" in
+        *modem*) skipped=$((skipped+1)); continue ;;
+      esac
+      mkdir -p "$p" 2>/bb/nb/null && created=$((created+1))
+    done
+  done
+  # Huawei'ye ozgu guvenlik/yonlendirme dugumleri (init.hisi.rc bunlari bekliyor)
+  for p in /dev/nve0 /dev/nve1 /dev/hw_bfm /dev/hwcrypto /dev/pmom /dev/rfile /dev/zipdev; do
+    [ -e "$p" ] && continue
+    mkdir -p "$p" 2>/bb/nb/null && created=$((created+1))
+  done
+  [ $created -gt 0 ] && m "### /dev/block sahte yollar: $created olusturuldu, $skipped modem (atlandi) ###"
+}
+
+# --- MISC cihazlarini mknod ile KENDIMIZ olustur ----------------------------
+# DIKKAT BU ADIM apexd'i SESSIZCE OLDUREN YARIŞI KALDIRIR.
+#
+# Olcum (onceki kosu):
+#   [31.03] avc: denied { create } for pid=429 comm="supervise"
+#                 name="loop-control" tcontext=u:object_r:tmpfs:s0
+# Denetleyici once `: > /dev/loop-control` ile DUZ BIR DOSYA yaratiyor,
+# sonra bind-mount etmeye calisiyor. O 1 saniyelik pencerede
+# apexd-bootstrap /dev/loop-control'i acar:
+#
+#   * duz dosya acilir (open() BASARILI olur)
+#   * ioctl(LOOP_CTL_GET_FREE) FAILED olur (karakter cihaz degil)
+#   * apexd bootstrap'ta LOG(FATAL) -> SIGABRT
+#
+# apexd'in kendi hata mesaji /dev/kmsg'ye tasmiyor; init "starting
+# service 'apexd-bootstrap'" yaziyor ama 5 saniye icinde sistem
+# kapaniyor ve sebep gorunmuyor. Tam da bu yuzden 'apexd-bootstrap
+# hic baslamiyor' sanildi.
+#
+# COZUM: bind-mount'a HIC GEREK YOK. /proc/misc her misc cihazin
+# minor numarasini veriyor; major sabit 10. Biz dogrudan karakter
+# cihazi mknod'luyoruz -- yarisi yok, bind yok, /devblk gerekmiyor.
+#
+# DIKKAT: minor'lar boot'ta DYNAMIC olarak atanir; sabit yazmiyoruz.
+#   /proc/misc ornegi:
+#       237 loop-control
+#         7 loop
+#        10 binder
+mknod_misc() {   # $1=hedef yol  $2=/proc/misc'teki isim
+  [ -c "$1" ] && return 0
+  [ -e "$1" ] && rm -f "$1" 2>/bb/nb/null      # duz dosya kalmasi olabilir
+  MIN=$(/bb/grep -E "^[ ]+$2\$" /proc/misc 2>/bb/nb/null | /bb/head -1 | /bb/awk '{print $1}')
+  [ -n "$MIN" ] || return 1
+  /bb/mknod "$1" c 10 "$MIN" 2>/bb/nb/null || return 1
+  [ -c "$1" ]
+}
+
+ensure_misc_devs() {
+  # DIKKAT: $(( )) ARITMETIGI KULLANILMIYOR. Onceki surumde made=$((made+1))
+  # vardi ve busybox ash her dongude
+  #     sh: vndbinder: bad number
+  # diye hata basiyordu (3 kez/saniye, logu kirletiyordu). Kosede
+  # nereden geldigi bulunamadi; sayac yerine DIZI kullaniyoruz.
+  made=""
+  mknod_misc /dev/loop-control loop-control && made="${made}l "
+  for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
+           16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+    [ -e "/dev/loop$i" ] && continue
+    /bb/mknod "/dev/loop$i" c 10 "$i" 2>/bb/nb/null && made="${made}l "
+  done
+  mknod_misc /dev/binder binder && made="${made}b "
+  mknod_misc /dev/hwbinder hwbinder && made="${made}h "
+  mknod_misc /dev/vndbinder vndbinder && made="${made}v "
+  if [ -n "$made" ]; then
+    m "### misc yeniden olusturuldu:$made"
+    m "###   $(/bb/ls -l /dev/loop-control /dev/binder 2>&1 | /bb/tr '\n' ' ')"
+  fi
+  return 0
+}
+
+draw_screen() {
+  # --- DURUM EKRANI ---------------------------------------------------------
+  # DIKKAT: kernel'e 'console=tty0' verdigimiz icin /dev/tty0 framebuffer
+  # konsolumuzdur. Yani buraya yazdigimiz her sey EKRANA cikar. Bu, ayri bir
+  # yazi ciftisi (font) gerektirmeden ekrana metin basmanin en kisa yolu.
+  #
+  # DIKKAT: once kernel'in kendi boot gunlugunu gosteriyordu; simdi kendi
+  # durum panomuzu yaziyoruz. Boylece ekrana bakarak teÅŸhis yapabiliyoruz:
+  # APEX kac modul, binder ayakta mi, Zygote basladi mi, ueventd ne yapti.
+  #
+  # DIKKAT: ESC dizileri busybox 'echo -e' ile yorumlanir:
+  #   \033[H  imleci sol ustĞµ gotur   \033[2J  ekrani temizle
+  #   \033[K  satir sonunu temizle
+  [ -c /dev/tty0 ] || return 0
+  t0() { /bb/echo -e "$1" > /dev/tty0 2>/bb/nb/null; }
+  t0 "\033[H\033[2J"
+  t0 "  HARMONYOS EMULATOR - ARM64 / Kirin 9000 firmware'\''i\033[K"
+  t0 "  ==============================================================\033[K"
+  t0 "\033[K"
+  t0 "  Sure        : $((n)) s\033[K"
+  t0 "  Kernel      : $(uname -r)\033[K"
+  t0 "\033[K"
+  t0 "  --- APEX ---\033[K"
+  t0 "  modul       : $(/bb/ls /apex 2>/bb/nb/null | /bb/grep -c apex)\033[K"
+  t0 "  bionic libc  : $([ -f /apex/com.android.runtime/lib64/bionic/libc.so ] && /bb/echo VAR || /bb/echo YOK)\033[K"
+  t0 "  vndk.v31    : $([ -d /apex/com.android.vndk.v31 ] && /bb/echo VAR || /bb/echo YOK)\033[K"
+  t0 "\033[K"
+  t0 "  --- CIHAZLAR ---\033[K"
+  t0 "  /dev/binder : $([ -c /dev/binder ] && /bb/echo VAR || /bb/echo YOK)\033[K"
+  t0 "  /dev/fb0    : $([ -c /dev/fb0 ] && /bb/echo VAR || /bb/echo YOK)\033[K"
+  t0 "\033[K"
+  t0 "  --- SERVISLER ---\033[K"
+  t0 "  calisan     : $(/bb/ps 2>/bb/nb/null | /bb/grep -vc '^[[:space:]]*PID')\033[K"
+  t0 "\033[K"
+  t0 "  Son 5 saniye icin seri cikti icin:\033[K"
+  t0 "  logs/boot-zygote.log\033[K"
+}
+
+n=0
+# DIKKAT: ensure_apex'in KAPALI KALMASI DENENDI VE BOZDU.
+# Olcum (SUPERVISE_APEX=0 kosusu): supervisor /apex'i hic yenilemiyor,
+# /apex bos kaliyor ve linker hicbir seyi baglayamiyor:
+#     apexd: CANNOT LINK EXECUTABLE "/system/bin/apexd":
+#            library "libc.so" not found
+# Yani supervisor'in mount'u ZORUNLU; apexd kendi mount'unu yapsa bile
+# bizimki lazim (once baglayip sonra devrediyoruz).
+SUPERVISE_APEX="${SUPERVISE_APEX:-1}"
+while [ $n -lt 900 ]; do
+  # DIKKAT (OLCUM 2026-10-15): denetleyici 15.6 saniyede sessize dondu;
+  # sonrasi hicbir sey yazmadi. Nerede durdugu ANLAILAMAZDI. Bu tek
+  # satirlik isaret dongunun BASINDA oldugu icin, logda gorulen son
+  # 'iter=' hangi asamada takildigini gosterir.
+  m "### iter=$n"
+  /system/bin/setprop ro.serialno unknown 2>/bb/nb/null
+  # DIKKAT: coldboot_done'u erken olustur
+  if [ $n -ge 1 ] && [ ! -e /dev/.coldboot_done ] && [ "${coldboot_done:-0}" = "0" ]; then
+    : > /dev/.coldboot_done 2>/bb/nb/null
+    coldboot_done=1
+    m "### /dev/.coldboot_done olusturuldu ###"
+  fi
+  pin_selinux
+  pin_printk
+  drain_init
+  # DIKKAT (2026-10-15): adbd TCP'de calisiyor ama Windows adb tarafinda
+  # cihaz "offline" kaliyor ve adbd HICBIR baglanti mesaji yazmiyor.
+  # Bu, konugun AGI olmadigi anlamina gelir: QEMU'nun hostfwd kurali
+  # (tcp::5555-:5555) ana makinede baglantiyi kabul eder, sonra guest'in
+  # 10.0.2.15:5555 adresine ulasmaya calisir. Konakta eth0 yoksa/kapali
+  # ise bu asla olmaz ve adb istemcisi zaman asimina ugrar.
+  # Biz agi kendimiz kuruyoruz (QEMU user-mode networking varsayilanlari:
+  # guest 10.0.2.15/24, ag gecidi 10.0.2.2, DNS 10.0.2.3).
+  [ "$n" -ge 15 ] && ensure_net
+  # DIKKAT (2026-10-15): adbd icin APEX'e ozel ld.config.txt simdiden
+  # kurulmali. Init adbd'yi class core aninda baslatiyor (n<20) ve o
+  # anda dosya yoksa linker "libadb_protos.so not found" deyip adbd
+  # olup duruyor -> svc=restarting.
+  [ "$n" -ge 3 ] && adbd_ldconfig
+  # adbd'yi erken baslat: framework'den bagimsiz, L5'in anahtarI.
+  # DIKKAT: eskiden n>=45 idi. Sayac ensure_apex tarafindan ezildigi icin
+  # (bkz. NOT) 45'e hic ulasilamiyordu ve adbd HIC BASLAMADI. Simdi
+  # sayac duzgun arttigi icin 20 yeterli (~30 saniye).
+  [ "$n" -ge 20 ] && ensure_adbd
+  fix_ldconfig
+  # DIKKAT (2026-10-16, L4 3. KOK NEDEN): /data dizinleri + zygote.
+  # 'on post-fs-data' CALISMIYOR: post-fs-data tetigini init'in
+  # fs_manager uretir, ama /data'yi INIT degil BIZ mount ediyoruz
+  # (mountapex tmpfs). OLCUM: init.environ.rc'deki 'on early-init'
+  # calisiyor (ro.crypto.state=unencrypted yazildi) ama
+  # 'on post-fs-data' bloklarinin hicbiri iz birakmiyor ve
+  # /data tamamen BOS kaliyor.
+  # Zygote de otomatik baslamiyor: tetikleyici
+  #     on zygote-start && property:ro.crypto.state=unencrypted
+  # hic tetiklenmiyor (ro.crypto.state'i biz erken set ediyoruz).
+  [ "$n" -ge 30 ] && ensure_zygote
+  # DIKKAT: asama takip isareti. Sadece TEK bir tur icin (n=60) yazilir,
+  # yoksa logu doyurur. 'iter=60' gorulup 'iter=61' gorulmezse denetleyici
+  # tam olarak bu asamada takilmistir.
+  [ "$n" -eq 60 ] && m "### iter=60 -> ldconfig bitti, apexe gidiyor"
+  [ "$SUPERVISE_APEX" = "1" ] && ensure_apex
+  ensure_ldconfig_final
+  [ "$n" -eq 60 ] && m "### iter=60 -> apex bitti"
+  # --- apexfiles teyidi (Faz 2.3) -------------------------------------------
+  # DIKKAT: apexd kendi mount'unu yapacaksa /system/apex altindaki arsivleri
+  # GORMESI gerekiyor. mountapex bunu bir kez kurar; ama init bazi
+  # durumlarda /system uzerine yeniden mount ederse bag kopar. Idempotent
+  # bir tekrar zararsiz ve ucuz.
+  if [ -n "" ]; then
+    if ! mountpoint -q /apexfiles 2>/bb/nb/null; then
+      mkdir -p /apexfiles 2>/bb/nb/null
+      mount -t ext4 -o ro /devblk/vda /apexfiles 2>/bb/nb/null \
+        && m "### /apexfiles yeniden baglandi ###"
+    fi
+    if mountpoint -q /apexfiles 2>/bb/nb/null; then
+      mountpoint -q /system/apex 2>/bb/nb/null || \
+        mount -o bind /apexfiles /system/apex 2>/bb/nb/null
+    fi
+  fi
+  # DIKKAT: ensure_fake_blocks SADECE BIR KEZ calisir. Tum rc dosyalarini
+  # grep -r ile taramak EROFS uzerinde saniyeler suruyor; her saniye
+  # calistirilirsa denetleyici o sureyle dolar ve asil onemi olan ise
+  # (/dev/binder'i geri baglamak) hicbir zaman siraya gelmez:
+  #     ProcessState: Opening '/dev/binder' failed: No such file or directory
+  #
+  # DIKKAT (HATA DUZELTMESI 2026-10-15): 'n=8' yanlistikti. supervise,
+  # 'exec /system/bin/init'TEN HEMEN ONCE setsid ile arka plana
+  # atiliyor; yani n=8 aninda init /dev'i HENUZ degistirmemisti. Olusan
+  # sahte dugumler init /dev'in UZERINE kendi tmpfs'ini mount ederken
+  # yok oluyordu. Dogru tetikleyici init'in /dev'i degistirmesidir:
+  # init kendi tmpfs'ini mount edince virtio blok dugumleri (/dev/vda*)
+  # kaybolur. Kaybolma anini bekleyip sahte yollari ONDAN sonra uretiyoruz.
+  if [ "${fb_done:-0}" = "0" ] && [ ! -e /dev/vda1 ]; then
+    fb_done=1
+    ensure_fake_blocks
+    m "### /dev vda* kayboldu -> sahte yollar uretildi (init /dev'i degistirdi) ###"
+  fi
+  # init /dev'in UZERINE kendi tmpfs'ini mount edip ueventd calistirir;
+  # ueventd yalnizca Android standartlarini olusturur, virtio blok ve loop
+  # dugumleri KAYBOLUR.
+  #
+  # DIKKAT: ONCEDEN ': > /dev/$b' ile DUZ DOSYA yaratip bind-mount
+  # ediliyordu. O 1 saniyelik pencerede apexd-bootstrap duz dosyayi
+  # acabiliyor ve ioctl(LOOP_CTL_GET_FREE) sessizce basarisiz oluyordu
+  # -> apexd SIGABRT -> bootstrap-apexd-failed.
+  # Artik dogrudan karakter cihazi mknod'luyoruz (/proc/misc'ten
+  # minor okuyarak). Yarisi yok, bind yok.
+  ensure_misc_devs
+  # Binder: Zygote, servicemanager, HAL'lar ve uygulama sureclerinin tamami
+  # binder uzerinden konusur; olmazsa hicbiri calismaz.
+  #
+  # DIKKAT: kernel'imiz CONFIG_ANDROID_BINDERFS=n ile derlendi, yani binder
+  # klasik MISC cihazidir: /dev/binder bir karakter cihaz (major 10, minor 0).
+  # BinderFS acikken /dev/binder bir DIZIN olur ve libbinder EISDIR alir:
+  #     ProcessState: Opening '/dev/binder' failed: Is a directory
+  # Binder: Zygote, servicemanager, HAL'lar ve uygulama sureclerinin tamami
+  # binder uzerinden konusur; olmazsa hicbiri calismaz.
+  # Binder geri baglama artiki mknod ile yapiliyor (ensure_misc_devs).
+  # DIKKAT: asagidaki bind-mount YEDEK yol olarak duruyor. Ensure_misc_devs
+  # calistiyorsa hicbiri gerekmiyor; /dev/binder karakter cihaz olarak
+  # zaten varsa dongu 'continue' eder ve dokunmaz.
+  #
+  # DIKKAT: '[ -f "/devblk/$f" ]' yazilirsa test /devblk//devblk/binder'a
+  # duser ve daima false olur (H1 hatasinin kaynagi). Dogru: /devblk/$b.
+  BINDERMOUNT=0
+  for f in /devblk/binder /devblk/hwbinder /devblk/vndbinder; do
+    b=$(basename "$f")
+    [ -c "/dev/$b" ] && continue
+    [ -f "/devblk/$b" ] || continue
+    : > "/dev/$b" 2>/bb/nb/null
+    mount -o bind "/devblk/$b" "/dev/$b" 2>/bb/nb/null && BINDERMOUNT=$((BINDERMOUNT+1))
+  done
+  # DIKKAT: bu olcu HER SANIYE yazilirsa logu doldurur. Sadece ilk
+  # basarili baglamada ve sonra durum degisirse bir kez yaziyoruz.
+  if [ $BINDERMOUNT -gt 0 ] && [ "${binder_ok:-0}" = "0" ]; then
+    binder_ok=1
+    m "### /dev/binder geri baglandi ($BINDERMOUNT): $(/bb/ls -l /dev/binder /dev/hwbinder /dev/vndbinder 2>&1 | /bb/tr '\n' ' ')"
+  fi
+
+  # --- DIAG: apexd'yi ELLE calistir ------------------------------------------
+  # DIKKAT NEDEN: apexd-bootstrap kendi hata mesajini /dev/kmsg'ye
+  # tasirmiyor; init sadece "bootstrap-apexd-failed" diyor ve 5 saniyede
+  # sistem kapaniyor. Sebebi gormenin TEK yolu apexd'yi elle calistirmak.
+  #
+  # DIKKAT: bu bir teşhis adimidir, müdahale DEGIL. Yalnizca kendi PID'imize
+  # dokunuruz (init'in kendi apexd'sine dokunmaz).
+  if [ $n -eq 14 ]; then
+    m "### DIAG: /system/bin/apexd -b elle calistiriliyor (25 sn) ###"
+    /system/bin/apexd -b > /tmp/apexd.out 2>&1 &
+    ap=$!
+    /bb/sleep 25
+    kill -9 $ap 2>/bb/nb/null
+    wait $ap 2>/bb/nb/null
+    m "### --- apexd ciktisi ($( /bb/wc -l < /tmp/apexd.out 2>/bb/nb/null ) satir) ---"
+    /bb/head -60 /tmp/apexd.out 2>/bb/nb/null | while read -r l; do m "### apexd| $l"; done
+    m "### --- apexd ciktisi bitti ---"
+  fi
+
+  # DIKKAT: BURADA ASLA '/system/bin/ueventd' calistirma veya pkill ile
+  # oldurme. ueventd, init binary'sinin AYNISI:
+  #     /system/bin/ueventd -> init
+  # Bu yuzden hem elle calistirmak hem de 'pkill -f /system/bin/ueventd'
+  # yapmak init'in KENDI ueventd surecini olduruyor. Yani bizim teÅŸhis
+  # aracimiz, araÅŸtirdigimiz Ã§Ã¶kmenin bir parÃ§asiydi:
+  #     init: starting service 'ueventd'...              (54.9s)
+  #     init: Service 'ueventd' (pid 2086) exited status 1  (142.9s)
+  # Once testimiz onu olduruyor, sonra init yeniden baslatip
+  # "critical process 'ueventd' exited 4 times" diyordu. Yanlis olcum
+  # yapmak, dogru olcumu gizliyordu.
+  #
+  # Dogru yol: ueventd'ye HIC dokunmadan, onun ciktisini init'in seri
+  # konolundan okumak (init servis ciktisini konsola yazar).
+  # --- ueventd TEHLIKESINI (sadece kendi PID'imizi oldurerek) ---------------
+  # init servis ciktisini oldugu icin (servis 'console' degil) init'in
+  # calistirdigi ueventd'nin ciktisini GOREMIYORUZ. Tek yol elle calistirmak.
+  #
+  # DIKKAT: ASLA 'pkill -f /system/bin/ueventd' KULLANMA.
+  #   /system/bin/ueventd -> init
+  # oldugu icin bu desen init'in KENDI gercek ueventd surecini de oldurur
+  # ve bizim testimiz, arastirdigimiz cokmenin bir parcasi olur.
+  # Yalnizca $up PID'ini olduruyoruz.
+  if [ $n -eq 40 ]; then
+    m "### ueventd elle calistiriliyor (12 sn, yalnizca kendi PID'imiz) ###"
+    /system/bin/ueventd > /tmp/uev.out 2>&1 &
+    up=$!
+    /bb/sleep 12
+    kill -9 $up 2>/bb/nb/null
+    wait $up 2>/bb/nb/null
+    m "### --- ueventd ciktisi ---"
+    /bb/cat /tmp/uev.out 2>/bb/nb/null | while read -r l; do m "### uev| $l"; done
+    m "### --- ueventd ciktisi bitti ($( /bb/wc -l < /tmp/uev.out 2>/bb/nb/null ) satir) ---"
+  fi
+
+  # DIKKAT: /bb/diag2 denetleyicinin DEGIL, sistemin durumunu olcer.
+  # n=25 biraz rastgele secildi: init 2. asamaya gecmis (/dev'i
+  # degistirmis), supervisor da /dev'i onarmis olmali. init'in early-init
+  #'indeki /bb/diag ile ARASINDAKI FARK teÅŸhisin konusu.
+  [ $n -eq 25 ] && /bb/diag2
+
+  # --- NABIZ (pulse) --------------------------------------------------------
+  # DIKKAT: buradaki amacimiz TAHMIN ETMEK degil OLCMEK. Olcum su:
+  #     logdaki 39 "starting service" satirinin TAMAMI "ueventd"
+  # Yani init "on post-fs-data" icinde kilitli; zygote/netd/servicemanager
+  # hic baslamiyor, class main hic tetiklenmiyor.
+  #
+  # AOSP'de "exec" komutu alt sureci bitene kadar init'i BEKLETIR. Yani
+  # post-fs-data'daki tek bir "exec" sonsuza kadar asili kalabilir ve
+  # butun boot orada durur. Bu, tahmin ettigimiz en olasi neden.
+  #
+  # Olcum yontemi: init'in DOGRUDAN cocuklarini (ppid == 1) listele ve
+  # kernel'in onlari nerede beklettigini /proc/<pid>/wchan'den oku.
+  # Takilan alt surecin adi ve wchan dogrudan gorunur.
+  #
+  # DIKKAT: /proc/<pid>/stat'ta comm parantez icinde ve BOSLUK icerebilir.
+  # Bu yuzden alan sayisiyla degil, "son )'den sonraki kismi" ayirarak
+  # cozuyoruz; aksi halde ppid yanlis okunur ve hicbir cocuk gorunmez.
+  if [ $((n % 15)) -eq 0 ]; then
+    KIDS=""
+    for pd in /proc/[0-9]*; do
+      pp=${pd#/proc/}
+      [ "$pp" = "1" ] && continue
+      st=$(/bb/cat "$pd/stat" 2>/bb/nb/null) || continue
+      rr=${st##*) }
+      tt=${rr#* }
+      ppid1=${tt%% *}
+      [ "$ppid1" = "1" ] || continue
+      nm=$(/bb/cat "$pd/comm" 2>/bb/nb/null)
+      wq=$(/bb/cat "$pd/wchan" 2>/bb/nb/null)
+      [ -n "$wq" ] || wq=${rr%% *}
+      KIDS="$KIDS $nm:$wq"
+    done
+    m "### nabiz#$n cocuk[$KIDS]"
+    m "###   apexd.status=$(/system/bin/getprop apexd.status 2>/bb/nb/null) sys.boot=$(/system/bin/getprop sys.boot_completed 2>/bb/nb/null) /system=$(/bb/mountpoint /system >/bb/nb/null 2>&1 && echo var || echo YOK) apex=$(/bb/ls /apex 2>/bb/nb/null | /bb/wc -l) ro.secure=$(/system/bin/getprop ro.secure 2>/bb/nb/null)/$(/system/bin/getprop ro.adb.secure 2>/bb/nb/null)"
+    # adbd durumu da her nabzda gorunur olsun.
+    m "###   net: [$(/bb/ls /sys/class/net 2>/bb/nb/null | /bb/tr '\n' ' ')] ip=$(/bb/ip -o -4 addr show 2>/bb/nb/null | /bb/tr '\n' ' ' | /bb/head -c 160) L4=$(/bb/netstat -an 2>/bb/nb/null | /bb/grep -c 5555) L6=$(/bb/netstat -ltn6 2>/bb/nb/null | /bb/grep -c 5555)"
+    m "###   adbd=$([ "${adbd_ok:-0}" = "1" ] && echo ayakta || echo yok) svc=$(/system/bin/getprop init.svc.adbd 2>/bb/nb/null) pid=${adbd_pid:-yok} tcp5555=$(/bb/grep -c ':15B3' /proc/net/tcp 2>/bb/nb/null) /dev/loop-control=$([ -e /dev/loop-control ] && echo var || echo YOK)"
+    # DIKKAT: init'in adbd stdout/stderr'i. Adbd calisiyor gibi gorunse
+    # bile svc=restarting ise burada cokum sebebi yaziyor.
+    isz=$(/bb/wc -c < /bb/nb/adbd-init.log 2>/bb/nb/null); isz=${isz:-0}
+    if [ "$isz" -gt "${iseen:-0}" ]; then
+      m "### adbdi+$(/bb/tail -c +$(( ${iseen:-0} + 1 )) /bb/nb/adbd-init.log 2>/bb/nb/null | /bb/tr '\n' '|' | /bb/head -c 300)"
+      iseen=$isz
+    fi
+    # DIKKAT (2026-10-15): adbd TCP'ye baglaniyor ama Windows adb tarafinda
+    # cihaz "offline" kaliyor. Adbd'nin baglanti aninda yazdigi mesajlar
+    # OZEL log dosyasina ekleniyor ama biz onu sadece BASLANGICTA
+    # basiyorduk, sonrasinda hic okumuyorduk. Bu blok /bb/nb/adbd.log
+    # dosyasindaki YENI kismi (dosya buyudukce) kmsg'e tasiyor.
+    asz=$(/bb/wc -c < /bb/nb/adbd.log 2>/bb/nb/null); asz=${asz:-0}
+    if [ "$asz" -gt "${adbd_seen:-0}" ]; then
+      m "### adbd+$(/bb/tail -c +$(( ${adbd_seen:-0} + 1 )) /bb/nb/adbd.log 2>/bb/nb/null | /bb/tr '\n' ' ' | /bb/head -c 240)"
+      adbd_seen=$asz
+    fi
+    # DIKKAT (2026-10-15): adbd TCP DINLEYICISINI ACMIYOR. Surec yasiyor
+    # (pid=2565) ama /proc/net/tcp'te 5555 (0x15B3) YOK, yani QEMU'nun
+    # hostfwd'i guest'e ulasamiyor ve RST donuyor -> Windows adb "offline".
+    # Adbd'nin hatasi logd'ye yaziliyor; logcat tamponunu bosaltiyoruz.
+    # logcat asili kalabilir diye arka planda calistirip 4 sn sonra olduruyoruz.
+    if [ ! -f /bb/nb/lc.pid ] && [ -x /system/bin/logcat ]; then
+      ( /system/bin/logcat -d -t 400 > /bb/nb/lc.txt 2>/bb/nb/null ) &
+      echo $! > /bb/nb/lc.pid
+      /bb/sleep 4
+      lcp=$(/bb/cat /bb/nb/lc.pid 2>/bb/nb/null)
+      [ -n "$lcp" ] && kill -9 "$lcp" 2>/bb/nb/null
+      rm -f /bb/nb/lc.pid
+      m "### logcat/adb: $(/bb/grep -i 'adbd' /bb/nb/lc.txt 2>/bb/nb/null | /bb/tail -5 | /bb/tr '\n' '|' | /bb/head -c 420)"
+      m "### logcat/son: $(/bb/grep -vi 'adbd' /bb/nb/lc.txt 2>/bb/nb/null | /bb/tail -3 | /bb/tr '\n' '|' | /bb/head -c 260)"
+    fi
+    # DIKKAT: apexd-bootstrap artik /system/apex'teki 22 arsivi BULUYOR
+    # ("Found pre-installed APEX /system/apex/com.android.adbd.apex" ...),
+    # yani gercek APEX aktivasyonu yapilabilir durumda. Tek eksik
+    # sey loop cihazi:
+    #     apexd: Failed to pre-allocate loop devices :
+    #            wait for '/dev/loop-control' timed out and took 50004ms
+    # Bu yuzden varligini olcuyoruz; yoksa yeniden mknod ediyoruz.
+    if [ ! -e /dev/loop-control ]; then
+      mknod_misc /dev/loop-control loop-control
+      m "### loop-control YOKTU -> yeniden olusturuldu"
+    fi
+  fi
+
+  # Durum ekranini 2 saniyede bir tazele.
+  [ $((n % 2)) -eq 0 ] && draw_screen
+
+  /bb/sleep 1
+  n=$((n+1))
+done

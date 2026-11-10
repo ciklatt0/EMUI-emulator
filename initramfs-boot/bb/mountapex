@@ -1,0 +1,263 @@
+#!/bb/sh
+# HarmonyOS: APEX modullerini bagla + linker yapilandirmasini uret.
+# init tarafindan 'on early-init' ile tetiklenir.
+#
+# DIKKAT (cift yazim onlemi): bu script init'in SERVISI olarak calistiginda
+# stdout /dev/null'a duser. Oysa ayni script /init icinde de dogrudan
+# cagriliyor ve orada stdout zaten /dev/kmsg. Iki durumu da tek komutla
+# karsilamak icin stdout'u KENDIMIZ /dev/kmsg'ye ceviriyoruz; boylece
+# sonra her satiri ayrica kmsg'ye yazmaya gerek kalmaz (cift satir olmazdi).
+exec >/dev/kmsg 2>&1
+/bb/echo "--- APEX mount (init early-init) ---"
+
+# DIKKAT (EVR-L29/Android 10): init coldboot_done bekler, 120 sn sonra kapatir.
+: > /dev/.coldboot_done 2>/bb/nb/null
+m "### /dev/.coldboot_done erken olusturuldu ###"
+
+APEX_OK=0; APEX_FAIL=0
+for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+  n=${entry%%:*}; name=${entry#*:}
+  dev=/dev/vda$n
+  [ -b "$dev" ] || continue
+  mkdir -p /apex/$name
+  if mount -t ext4 -o ro $dev /apex/$name 2>/bb/nb/null; then
+    APEX_OK=$((APEX_OK+1))
+  else
+    APEX_FAIL=$((APEX_FAIL+1)); /bb/echo "  [$name] mount basarisiz"
+  fi
+done
+/bb/echo "  APEX: $APEX_OK basarili, $APEX_FAIL basarisiz"
+
+# --- /dev KALICI KOPYASI ----------------------------------------------------
+# DIKKAT: init /dev'in UZERINE kendi tmpfs'ini mount edip ueventd'yi
+# calistirir. ueventd yalnizca Android'in standart dugumlerini olusturdugu
+# icin virtio blok dugumleri KAYBOLUR:
+#     ls: /dev/vda*: No such file or directory
+# O andan sonra /apex'i tazelemeye calisan denetleyici mount edecek cihazi
+# bulamaz ve hicbir sey baglanamaz.
+#
+# Cozum: dugumleri /dev disinda kalici bir yola (/devblk) bind-mount etmek.
+# Bag mount noktasi kok dizinde oldugu icin /dev'in degistirilmesinden
+# ETKILENMEZ -- init /dev'i ne yaparsa yapsin, /devblk/vda* yerinde kalir.
+mkdir -p /devblk
+BLK=0
+# DIKKAT: bind mount HEDEFIN var olmasini gerektirir. Once bos dosya
+# yaratiyoruz, sonra uzerine bagliyoruz. (Yoksa "0" cikiyor ve
+# /devblk/vda6: Can't lookup blockdev hatasi aliniyor.)
+for n in 1 2 3 4 5; do
+  : > /devblk/vda$n 2>/bb/nb/null
+  mount -o bind /dev/vda$n /devblk/vda$n 2>/bb/nb/null && BLK=$((BLK+1))
+done
+for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+  n=${entry%%:*}
+  : > /devblk/vda$n 2>/bb/nb/null
+  mount -o bind /dev/vda$n /devblk/vda$n 2>/bb/nb/null && BLK=$((BLK+1))
+done
+# DIKKAT (2026-10-15): /data bolumu de kalici dugume sahip OLMALI.
+# Yoksa /init'teki mount denemesi sessizce basarisiz oluyor ve /data
+# gercek partition yerine initramfs'te bir dizin kaliyor; vold yine
+# "sBlkidContext == nullptr" ile cokuyor:
+#     vold: Check failed: android::vold::sBlkidContext != nullptr
+#     init: Failure (reboot suppressed): init_user0_failed
+if [ -n "29" ]; then
+  : > /devblk/vda29 2>/bb/nb/null
+  mount -o bind /dev/vda29 /devblk/vda29 2>/bb/nb/null \
+    && BLK=$((BLK+1))
+fi
+/bb/echo "  /devblk kalici cihaz dugumleri: $BLK"
+
+# --- loop cihazlari ----------------------------------------------------------
+# DIKKAT: apexd APEX dosyalarini acmak icin /dev/loop-control UZERINDE
+# LOOP_CTL_GET_FREE cagirir. Yoksa 50 saniye bekleyip pes ediyor:
+#     apexd: Failed to pre-allocate loop devices : wait for '/dev/loop-control' timed out
+# Sonrasi: apexd-bootstrap 'critical' oldugu icin init sistemi kapatiyor.
+#
+# DIKKAT: bu dugumler de /dev'in altinda oldugu icin init /dev'i degistirince
+# kaybolurlar. Ayni /devblk cozumu: kalici kopyala, sonra geri bagla.
+LOOPN=0
+if [ -e /dev/loop-control ]; then
+  : > /devblk/loop-control 2>/bb/nb/null
+  mount -o bind /dev/loop-control /devblk/loop-control 2>/bb/nb/null && LOOPN=$((LOOPN+1))
+fi
+for l in /dev/loop*; do
+  b=$(basename "$l")
+  : > /devblk/$b 2>/bb/nb/null
+  mount -o bind "$l" /devblk/$b 2>/bb/nb/null && LOOPN=$((LOOPN+1))
+done
+/bb/echo "  /devblk loop dugumleri: $LOOPN"
+
+# --- adbd icin APEX'e ozel linker config -------------------------------------
+# DIKKAT (2026-10-15, ONEMLI): adbd bir APEX ikilisi. Linker, /apex/ icindeki
+# bir ikiliyi calistirirken GLOBAL /linkerconfig/ld.config.txt yerine
+#     /apex/<apex>/etc/ld.config.txt
+# dosyasini okumaya calisir ve dosya yoksa linki KURAMAZ:
+#     linker: Warning: couldn't read config file
+#             "/apex/com.android.adbd/etc/ld.config.txt"
+#     CANNOT LINK EXECUTABLE "/apex/com.android.adbd/bin/adbd":
+#            library "libadb_protos.so" not found: needed by main executable
+#
+# Dolayisiyla bu dosya OLMAK ZORUNDA. APEX'in kendi /etc dizininde yalnizca
+# init.rc var (olculdu: 1 dosya). Dizin APEX'te salt okunur oldugu icin
+# UZERINE dizin bind-mount ediyoruz; altindaki init.rc'i kopyalayarak
+# gizlemiyoruz.
+#
+# Arama yollari readelf -d ve erofs listesiyle OLCULDU:
+#   /apex/com.android.adbd/lib64 -> libadb_protos, libbase, libc++,
+#                                   libcrypto, libcutils, protobuf
+#   /system/lib64                -> libadbd_fs.so, libadbd_auth.so,
+#                                   liblog.so, libselinux.so
+#   /apex/com.android.runtime/lib64/bionic -> libc, libm, libdl
+# (/system/lib64'teki karsiliklari da var; siralama onemsiz, ilk bulan
+#  kazanir.)
+ADBD_LD=/apex/com.android.adbd/etc/ld.config.txt
+if [ -d /apex/com.android.adbd/etc ] && [ ! -f "$ADBD_LD" ]; then
+  mkdir -p /bb/nb/adbdetc
+  {
+    echo "dir.system = /system/bin/:/system/lib64/:/apex/com.android.runtime/lib64/bionic/:/apex/com.android.adbd/bin/:/apex/com.android.adbd/lib64/"
+    echo "dir.apex_com.android.adbd = /apex/com.android.adbd/bin/:/apex/com.android.adbd/lib64/"
+    echo ""
+    echo "[system]"
+    echo "namespace.default.search.paths = /system/bin:/system/lib64:/apex/com.android.runtime/lib64/bionic:/apex/com.android.adbd/lib64"
+    echo "namespace.default.interpreter = /system/bin/linker64"
+    echo "namespace.default.isolated = false"
+    echo "namespace.default.per_library_path = false"
+    echo ""
+    echo "[apex_com.android.adbd]"
+    echo "namespace.default.search.paths = /apex/com.android.adbd/bin:/apex/com.android.adbd/lib64:/system/lib64:/apex/com.android.runtime/lib64/bonic"
+    echo "namespace.default.interpreter = /system/bin/linker64"
+    echo "namespace.default.isolated = false"
+    echo "namespace.default.per_library_path = false"
+  } > /bb/nb/adbdetc/ld.config.txt
+  cp /apex/com.android.adbd/etc/init.rc /bb/nb/adbdetc/init.rc 2>/bb/nb/null
+  if mount -o bind /bb/nb/adbdetc /apex/com.android.adbd/etc 2>/bb/nb/null; then
+    /bb/echo "  adbd: /apex/com.android.adbd/etc/ld.config.txt hazir"
+  else
+    /bb/echo "  adbd: ld.config.txt bind BASARISIZ"
+  fi
+else
+  /bb/echo "  adbd: ld.config.txt $([ -f "$ADBD_LD" ] && echo zaten || echo 'yok (etc dizini yok)')"
+fi
+
+# --- apexfiles: apexd'in kendi mount'unu yapabilmesi icin -------------------
+# Faz 2.3. Mantik:
+#   apexd, /system/apex/*.apex arsivlerini loop device'a baglayip KENDISI
+#   mount eder ve veritabanini doldurur. Su an /system/apex BOS oldugu icin
+#   "0 packages restored" diyor.
+#   /system EROFS (salt okunur) ama bir dizini UZERINE bind-mount
+#   edebiliriz. Orijinal arsivlar kendi partition'imizda (/devblk/vda<N>).
+#
+# DIKKAT: bu adim yalnizca apexfiles partition'i diskte varsa calisir
+# (80-build-bootdisk.sh, APEXFILES=1). Yoksa yana baglama yolu devrede.
+if [ -n "" ]; then
+  mkdir -p /devblk /apexfiles
+  : > /devblk/vda 2>/bb/nb/null
+  if mount -o bind /dev/vda /devblk/vda 2>/bb/nb/null \
+     || mount -o bind /devblk/vda /devblk/vda 2>/bb/nb/null; then
+    if mount -t ext4 -o ro /devblk/vda /apexfiles 2>/bb/nb/null; then
+      AF=$(/bb/ls /apexfiles/*.apex 2>/bb/nb/null | /bb/wc -l)
+      /bb/echo "  /apexfiles: $AF arsiv (vda)"
+      # /system/apex'in UZERINE bagliyoruz. EROFS olmasi engel degil:
+      # bind-mount yazma gerektirmez, sadece hedefi degistirir.
+      if mount -o bind /apexfiles /system/apex 2>/bb/nb/null; then
+        /bb/echo "  /system/apex -> /apexfiles  baglandi (apexd karsilayacak)"
+      else
+        /bb/echo "  /system/apex baglanamadi -- apexd yine 0 paket gorecek"
+      fi
+    else
+      /bb/echo "  /apexfiles mount basarisiz (vda)"
+    fi
+  else
+    /bb/echo "  /devblk/vda baglanamadi"
+  fi
+fi
+
+# --- binder dugumleri --------------------------------------------------------
+# DIKKAT: Zygote, app_process, servicemanager ve Huawei HAL'larinin TAMAMI
+# binder uzerinden konusur. Binder olmadan hicbiri calismaz:
+#     ProcessState: Opening '/dev/binder' failed: No such file or directory
+#     ProcessState: Binder driver '/dev/binder' could not be opened. Terminating.
+# Binder dugumleri de /dev'in altinda oldugu icin init /dev'i degistirince
+# kaybolurlar; ayni /devblk cozumu kullanilir.
+# --- binder -----------------------------------------------------------------
+# DIKKAT: kernel'imiz CONFIG_ANDROID_BINDERFS=n ile derlendi. Binder artik
+# klasik MISC cihazidir: /dev/binder bir KARAKTER CIHAZI (major 10, minor 0).
+# BinderFS acikken /dev/binder bir DIZIN olur ve libbinder EISDIR alir:
+#     ProcessState: Opening '/dev/binder' failed: Is a directory
+# Bu yuzden binderfs mount EDMIYORUZ; /dev/binder'i oldugu gibi bagliyoruz.
+#
+# DIKKAT: onceki denemede binderfs icin /devblk/binder DIZINI olusturulmusdu.
+# Artik gerekmiyor ve bind'i bozuyor:
+#     mountapex: can't create /devblk/binder: Is a directory
+# O yuzuden onu temizliyoruz: karakter cihaz baglayabilmek icin HEDEF
+# dosya olmali.
+/bb/echo "  /dev binder: $(/bb/ls -d /dev/binder /dev/hwbinder /dev/vndbinder 2>&1 | /bb/tr '\n' ' ')"
+rm -rf /devblk/binder 2>/bb/nb/null
+BIND=0
+for b in /dev/binder /dev/hwbinder /dev/vndbinder; do
+  name=$(basename "$b")
+  [ -e "$b" ] || continue
+  rm -rf "/devblk/$name" 2>/bb/nb/null
+  : > "/devblk/$name" 2>/bb/nb/null
+  mount -o bind "$b" "/devblk/$name" 2>/bb/nb/null && BIND=$((BIND+1))
+done
+/bb/echo "  /devblk binder dugumleri: $BIND"
+
+# VNDK takma adi. linkerconfig VNDK modulunu SABIT isimle arar:
+#   Unable to access VNDK APEX at path: /apex/com.android.vndk.v31
+# Bizim partition'in adi com.android.vndk.current; ayni cihazi v31 adiyle
+# de bagliyoruz.
+mkdir -p /apex/com.android.vndk.v31
+for entry in  6:com.android.adbd 7:com.android.apex.cts.shim 8:com.android.appsearch 9:com.android.art 10:com.android.conscrypt 11:com.android.extservices 12:com.android.i18n 13:com.android.ipsec 14:com.android.media.swcodec 15:com.android.media 16:com.android.mediaprovider 17:com.android.neuralnetworks 18:com.android.os.statsd 19:com.android.permission 20:com.android.resolv 21:com.android.runtime 22:com.android.scheduling 23:com.android.sdkext 24:com.android.tethering.inprocess 25:com.android.tzdata 26:com.android.vndk.current 27:com.android.wifi 28:payload; do
+  case "$entry" in
+    *:com.android.vndk.current)
+      if mount -t ext4 -o ro /dev/vda${entry%%:*} /apex/com.android.vndk.v31 2>/bb/nb/null; then
+        /bb/echo "  [+] /apex/com.android.vndk.v31 (takma ad)"
+      fi ;;
+  esac
+done
+
+# --- /apex/apex-info-list.xml ----------------------------------------------
+# DIKKAT (GERI ALMA 2026-10-16, KRITIK): bu dosyayi URETMEK sistemi
+# bozuyor. Onceki gerekce "linkerconfig APEX yollarini yazmiyor"
+# idi; bu dogruydu ama COZU DEGILDI:
+#
+#   - linkerconfig bu dosyayi /apex/apex-info-list.xml olarak okuyor
+#   - hw/init.rc early-init blogunda init onu "exec" ile calistiriyor:
+#       exec -- /system/bin/bootstrap/linkerconfig
+#            --target /linkerconfig/bootstrap
+#   - Dosya YOKSA linkerconfig ANINDA abort ediyor ve exec hizla
+#     donuyor; early-init biter, class core baslar. (HIZLI YOL)
+#   - Dosya VARSA linkerconfig CALISIYOR, tam config uretiyor ve
+#     init onu BEKLER. TCG emulasyonunda bu dakikalarca suruyor ve
+#     su sonucu veriyor:
+#         init: starting service ueventd... -> exited status 1
+#         (hicbir servis baslamiyor, adbd bile calismiyor)
+#   - Ayrica uretilen config APEX kutuphane yollarini zaten
+#     icermiyor (olculdu: grep -c apex -> 4, sadece runtime).
+#
+# Yani dosyanin YOKLUZU bir hata degil, hizli yoldur. Asil kaynak
+# zaten bizim fix_ldconfig (search.paths + permitted.paths +
+# vendor bolumu). Dosya bilerek URETILMEZ.
+
+# --- linker yapilandirmasi --------------------------------------------------
+# DIKKAT (KRITIK HATA DUZELTMESI 2026-10-16): bu cagri KOSULSUZDU ve
+# mountapex supervisor dongusunde TEKRAR cagriliyor. Her cagrida
+# /linkerconfig/ld.config.txt UZERINE yaziliyor; o da bizim
+# yamalanmis configimizi SIFIRLIYOR:
+#     W linker: failed to find generated linker configuration from
+#               "/linkerconfig/ld.config.txt"
+#     F linker: CANNOT LINK EXECUTABLE "/r/system/bin/init":
+#               library "libc.so" not found
+# linkerconfig'in KENDISI basarisiz (asagida gorulecek) ama yine de
+# dosyayi bozuyor. Biz configi kendimiz uretiyoruz (fix_ldconfig).
+# COZUM: sadece config HENUZ YOKSA calistir.
+mkdir -p /linkerconfig
+if [ -f /linkerconfig/ld.config.txt ]; then
+  /bb/echo "  ld.config.txt: zaten var, linkerconfig TEKRAR CALISTIRILMADI"
+else
+  /system/bin/linkerconfig --target /linkerconfig 2>&1 | while read l; do /bb/echo "  $l"; done
+fi
+N_APEX=$(/bb/grep -c '/apex/' /linkerconfig/ld.config.txt 2>/bb/nb/null)
+/bb/echo "  ld.config.txt: ${N_APEX:-0} APEX yolu"
+
+/bb/echo "--- bitti ---"
