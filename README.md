@@ -34,23 +34,9 @@ bash scripts/verify_evr.py                    # verify extracted partitions
 
 ## Current Status
 
-L4 (Zygote + SystemServer) is now **working** on EVR-L29.
+The **L4 milestone is reached**. On EVR-L29 the emulator mounts 5/5 EROFS partitions and 23 APEX modules, compiles and loads the SELinux policy, gets `init` to second stage, and starts both **Zygote** (socket created) and **SystemServer** (HAL services launching). A run then survives 300+ seconds until the Huawei `hw_init` watchdog (`InitProcessWatchdog_UserStack`) kills init with `Attempted to kill init` — a stability problem, not a bringup blocker.
 
-| Level | Criterion | Status |
-|-------|-----------|--------|
-| L0 | Firmware extracted, 5/5 partitions verified | ✅ |
-| L1 | Kernel + Android `init` boots, reaches second stage | ✅ |
-| L2 | Partitions + 23 APEX mounted, ~50 Kirin HALs running | ✅ |
-| L3 | `apexd-bootstrap` cleanly exits | ✅ |
-| L4 | `servicemanager` + **Zygote** + **SystemServer** running | ✅ |
-| L5 | `adb shell` into HarmonyOS | ⬜ |
-| L6 | Stage model / `Ability` running | ⬜ |
-| L7 | ArkUI renders, app interaction | ⬜ |
-| L8 | One-click runnable package | ⬜ |
-
-**Last run** (`logs/boot-zygote-evr.log`): 5/5 EROFS + 23 APEX mounts, SELinux policy compiled and loaded, `init` reached second stage, Zygote started (socket created), SystemServer started (HAL services launching), 300+ seconds uptime before watchdog.
-
-**Remaining issue:** Huawei `hw_init` watchdog (`InitProcessWatchdog_UserStack`) kills init at ~302 s with `Attempted to kill init`. This is post-L4 stability, not an L4 blocker.
+The road ahead is short: get a working `adb shell` into the running userspace, install and launch a real APK, then get the Launcher UI to render on screen.
 
 Detailed diagnosis and roadmap: **[PLAN.md](PLAN.md)**
 
