@@ -1,4 +1,4 @@
-# HarmonyOS Emulator (EVR-L29 / EMUI 9-10)
+# EMUI 9/10 Emulator (EVR-L29)
 
 Running Huawei P30 lite (EVR-L29) firmware — **EMUI 9/10 (Android 10, SDK 29)** — on an emulator under QEMU TCG (aarch64).
 
@@ -93,7 +93,7 @@ All share the same shape: **a wrong format assumption, and the error silently go
 ## Four Structural Traps
 
 - **`file` says APEX payload is "ext2", but `mount -t ext2` fails.** ext4 is backward compatible; but the kernel's ext2 driver rejects it. Use `-t ext4`.
-- **`/system/lib64/ld-android.so` is a stub** (9392 bytes, 0644). Real linker is `/system/bin/linker64` → symlink → `/apex/com.android.runtime/bin/linker64`. **No HarmonyOS binary runs without APEX mounted.**
+- **`/system/lib64/ld-android.so` is a stub** (9392 bytes, 0644). Real linker is `/system/bin/linker64` → symlink → `/apex/com.android.runtime/bin/linker64`. **No firmware binary runs without APEX mounted.**
 - **`/lib` and `/lib64` are separate.** glibc's `ld.so` searches `/lib` first; if both are mounted you get `wrong ELF class: ELFCLASS32`.
 - **`ld.config.txt` is sectioned** (`[legacy]` and `[postinstall]`); both define `namespace.default.search.paths`. If APEX paths are appended with `tail -1` they fall into `[postinstall]` and have no effect. Correct rule: **last `search.paths` *before* the first `asan` line.** Without this fix: 9/17 resolved; after: **17/17**.
 
@@ -133,17 +133,8 @@ scripts/
   72-extract-apex-files.sh       extract original .apex archives (Phase 2.1)
   80-build-kernel.sh             custom kernel (EROFS/virtio/binder/SELinux)
   91-log-summary.sh              <<< run summary (7000 lines -> 15 lines)
-  110-harmony-shell.sh           <<< HarmonyOS shell inside chroot (working)
-  120/121/131/140-*.py           inventory + API extraction
-  130-lib-proof.c/.sh            NDK call to Huawei library
-
-analysis/
-  huawei-libraries.txt      Huawei libraries
-  library-index.tsv         full index of 2710 libraries
-  binary-deps.tsv           binary -> dependency
-  huawei-native-api.txt     2.75 MB API surface (demangled)   [generated]
-  huawei-java-api.txt       11 MB Java API                      [generated]
-  java-api-all.txt          38 MB all Java API                  [generated]
+  120/121/131/140-*.py           inventory + API extraction (needs the archived system tree)
+  130-lib-proof.c/.sh            NDK call to Huawei library (needs the archived system tree)
 ```
 
 ---
