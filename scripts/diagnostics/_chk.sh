@@ -1,0 +1,10 @@
+#!/bin/bash
+S="$(dirname "$0")/../81-boot-zygote.sh"
+bash "$(dirname "$0")/../94-fix-crlf.sh" "$S"
+bash -n "$S" && echo "SYNTAX-OK"
+echo "--- APEX_LIST ikameleri:"
+grep -n 'APEX_LIST__' "$S"
+echo "--- [apex] bolumu kodu:"
+grep -n 'apex\.\$nm' "$S"
+grep -n 'link.public =' "$S"
+grep -n 'link.default =' "$S"

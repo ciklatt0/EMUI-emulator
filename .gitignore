@@ -1,0 +1,66 @@
+# --- uretilen / buyuk ciktilar ---------------------------------------------
+# Bu projenin kaynak kodu TAMAMEN scripts/ + README + PLAN. Geri kalan
+# her sey yeniden uretilir; versiyonlamaya girmesi sadece yer kaplar.
+#
+# DIKKAT: analysis/*.txt dosyalari 50 MB'tan fazla ve scripts/120,121,140
+# ile yeniden uretiliyor. Kucuk olanlar (huawei-libraries.txt, library-index.tsv,
+# binary-deps.tsv) referans olarak tutuluyor.
+analysis/huawei-java-api.txt
+analysis/java-api-all.txt
+analysis/huawei-native-api.txt
+analysis/process-maps.txt
+analysis/loaded-libs.txt
+
+# --- loglar ------------------------------------------------------------------
+# Her kosu 70 KB yaziyor ve stop-emulator.cmd zaten arsivliyor.
+logs/
+
+# --- kernel / imajlar --------------------------------------------------------
+# phase1/kernel/Image  : 36 MB derlenmis kernel (80-build-kernel.sh uretir)
+# phase1/out/*.img     : initramfs (81-boot-zygote.sh her kosuda uretir)
+# phase1/rootfs/bin/busybox : 2.2 MB cross-compile sonucu
+phase1/kernel/Image
+phase1/kernel/.harmony-kernel.ok
+phase1/out/
+phase1/rootfs/
+
+# --- python ------------------------------------------------------------------
+__pycache__/
+*.pyc
+
+# --- ajan araclari (proje kaynagi DEGIL) -----------------------------------
+# .agents/skills/ 70+ dosyalik bir OpenCode beceri kutuphanesi. Projenin
+# hicbir parcasi degil; depoyu yalnizca HarmonyOS emu kaynagiyla sinirli
+# tutmak icin disariada birakiliyor. Dosyalar diskte DURUYOR, sadece
+# versiyonlanmiyor.
+.agents/
+skills-lock.json
+
+# --- editor / OS -------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+# --- WSL build ciktilari (buyuk; depoya girmez) ----------------------------
+apex/
+apexfiles/
+evr-boot/
+evr-payload/
+evr-super-out/
+evr-data-root/
+busybox-*/
+linux-6.6/
+linux-6.6.tar.xz
+ndk/
+dlprobe/
+phase1/
+netboot.tar.gz
+probe-disk.img
+vmlinuz
+vmlinuz.part
+*.tar.bz2
+*.deb
+
+# build loglari
+*.log

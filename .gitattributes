@@ -1,0 +1,21 @@
+# SATIR SONU KRITIK: bash scriptleri CRLF olursa HEPsi bozulur --
+# "exec: /init\r: not found", "syntax error near unexpected token $'\r'".
+# Bu projenin kaynak kodunun TAMAMI .sh/.py; o yuzden satir sonunu
+# depoda LF'de sabitliyoruz.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.cmd   text eol=crlf
+*.md    text eol=lf
+*.tsv   text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.xml   text eol=lf
+
+*.c     text eol=lf
+*.cfg   text eol=lf
+
+# binary
+*.img   binary
+*.apex  binary
+*.so    binary
+Image   binary
